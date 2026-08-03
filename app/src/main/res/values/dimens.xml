@@ -1,0 +1,4 @@
+<resources>
+    <dimen name="mug_card_stroke">1dp</dimen>
+    <dimen name="mug_card_selected_stroke">2dp</dimen>
+</resources>

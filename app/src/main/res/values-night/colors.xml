@@ -1,0 +1,9 @@
+<resources>
+    <color name="ember_ink">#F7EEE7</color>
+    <color name="ember_cream">#100E0D</color>
+    <color name="ember_copper">#F58255</color>
+    <color name="ember_copper_dark">#FFAE8C</color>
+    <color name="ember_sage">#A8BBAE</color>
+    <color name="ember_surface">#1C1816</color>
+    <color name="ember_outline">#493B35</color>
+</resources>

@@ -1,0 +1,15 @@
+<resources>
+    <style name="Theme.EmberCompanion" parent="Theme.Material3.DayNight.NoActionBar">
+        <item name="colorPrimary">@color/ember_copper</item>
+        <item name="colorOnPrimary">@android:color/white</item>
+        <item name="colorSecondary">@color/ember_sage</item>
+        <item name="colorSurface">@color/ember_surface</item>
+        <item name="colorOnSurface">@color/ember_ink</item>
+        <item name="colorOutline">@color/ember_outline</item>
+        <item name="android:fontFamily">sans</item>
+        <item name="android:navigationBarColor">@color/ember_cream</item>
+        <item name="android:statusBarColor">@color/ember_cream</item>
+        <item name="android:colorAccent">@color/ember_copper</item>
+        <item name="android:windowBackground">@color/ember_cream</item>
+    </style>
+</resources>
