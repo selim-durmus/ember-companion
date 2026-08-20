@@ -6,6 +6,7 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.os.Build
 import androidx.core.app.NotificationCompat
@@ -22,14 +23,16 @@ import java.util.Locale
 class EmberConnectionService : LifecycleService() {
     private lateinit var repository: EmberRepository
     private lateinit var notificationManager: NotificationManager
+    private lateinit var readyNotificationPreferences: SharedPreferences
+    private lateinit var readyNotificationGate: ReadyNotificationGate
     private var foregroundStarted = false
-    private var previousLiquidState: Int? = null
 
     override fun onCreate() {
         super.onCreate()
         repository = (application as EmberApplication).repository
         notificationManager = getSystemService(NotificationManager::class.java)
-        previousLiquidState = repository.state.value.snapshot.liquidState
+        readyNotificationPreferences = getSharedPreferences(READY_STATE_PREFERENCES, Context.MODE_PRIVATE)
+        readyNotificationGate = restoreReadyNotificationGate(repository.state.value)
         createNotificationChannels()
         lifecycleScope.launch {
             repository.state.collect(::handleState)
@@ -65,13 +68,48 @@ class EmberConnectionService : LifecycleService() {
 
     private fun handleState(state: EmberAppState) {
         if (foregroundStarted) notificationManager.notify(ONGOING_NOTIFICATION_ID, ongoingNotification(state))
-        val liquidState = state.snapshot.liquidState
-        val reachedTarget = state.connected && state.snapshotFresh && liquidState == 6 &&
-            previousLiquidState != 6 && (state.snapshot.targetTemperatureC ?: 0f) > 0f
-        if (reachedTarget) notifyReady(state)
-        previousLiquidState = liquidState
+        val hasLiveSnapshot = state.connected && state.snapshotFresh
+        val decision = readyNotificationGate.update(
+            mugAddress = state.snapshotAddress ?: state.selectedAddress,
+            targetCelsius = state.snapshot.targetTemperatureC,
+            currentCelsius = state.snapshot.currentTemperatureC.takeIf { hasLiveSnapshot },
+            liquidState = state.snapshot.liquidState.takeIf { hasLiveSnapshot },
+        )
+        if (decision.stateChanged) persistReadyNotificationGate()
+        if (decision.shouldNotify) notifyReady(state)
         EmberWidgetProvider.updateAll(this, state)
         EmberTileService.requestUpdate(this)
+    }
+
+    private fun restoreReadyNotificationGate(state: EmberAppState): ReadyNotificationGate {
+        if (readyNotificationPreferences.getBoolean(KEY_READY_STATE_INITIALIZED, false)) {
+            return ReadyNotificationGate(
+                mugAddress = readyNotificationPreferences.getString(KEY_READY_MUG_ADDRESS, null),
+                targetCelsius = readyNotificationPreferences.takeIf { it.contains(KEY_READY_TARGET) }
+                    ?.getFloat(KEY_READY_TARGET, 0f),
+                armed = readyNotificationPreferences.getBoolean(KEY_READY_ARMED, true),
+            )
+        }
+
+        return ReadyNotificationGate(
+            mugAddress = state.snapshotAddress ?: state.selectedAddress,
+            targetCelsius = state.snapshot.targetTemperatureC,
+            armed = !(state.snapshotFresh && state.snapshot.liquidState == 6),
+        ).also {
+            readyNotificationGate = it
+            persistReadyNotificationGate()
+        }
+    }
+
+    private fun persistReadyNotificationGate() {
+        readyNotificationPreferences.edit().apply {
+            putBoolean(KEY_READY_STATE_INITIALIZED, true)
+            readyNotificationGate.mugAddress?.let { putString(KEY_READY_MUG_ADDRESS, it) }
+                ?: remove(KEY_READY_MUG_ADDRESS)
+            readyNotificationGate.targetCelsius?.let { putFloat(KEY_READY_TARGET, it) }
+                ?: remove(KEY_READY_TARGET)
+            putBoolean(KEY_READY_ARMED, readyNotificationGate.armed)
+        }.apply()
     }
 
     private fun ongoingNotification(state: EmberAppState) = NotificationCompat.Builder(this, CHANNEL_CONNECTION)
@@ -156,6 +194,11 @@ class EmberConnectionService : LifecycleService() {
         private const val CHANNEL_READY = "ember_ready"
         private const val ONGOING_NOTIFICATION_ID = 4101
         private const val READY_NOTIFICATION_ID = 4102
+        private const val READY_STATE_PREFERENCES = "ember_ready_notification_state"
+        private const val KEY_READY_STATE_INITIALIZED = "initialized"
+        private const val KEY_READY_MUG_ADDRESS = "mug_address"
+        private const val KEY_READY_TARGET = "target_celsius"
+        private const val KEY_READY_ARMED = "armed"
         private const val ACTION_HEATER_OFF = "dev.nicky.ember.action.HEATER_OFF"
         private const val ACTION_STOP = "dev.nicky.ember.action.STOP_MONITORING"
 
