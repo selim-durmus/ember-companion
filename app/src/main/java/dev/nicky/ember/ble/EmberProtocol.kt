@@ -52,6 +52,15 @@ object EmberProtocol {
         return raw / 100f
     }
 
+    fun decodeFirmware(value: ByteArray): FirmwareInfo? {
+        if (value.size < 4) return null
+        return FirmwareInfo(
+            firmware = littleEndianU16(value, 0),
+            hardware = littleEndianU16(value, 2),
+            bootloader = value.takeIf { it.size >= 6 }?.let { littleEndianU16(it, 4) },
+        )
+    }
+
     fun snapTargetForSlider(celsius: Float): Float = round(celsius * 2f) / 2f
 
     fun encodeName(name: String): ByteArray {
@@ -87,8 +96,18 @@ object EmberProtocol {
 
     private fun characteristic(id: Int): UUID = UUID.fromString(UUID_TEMPLATE.format(id))
 
+    private fun littleEndianU16(value: ByteArray, offset: Int): Int {
+        return (value[offset].toInt() and 0xff) or ((value[offset + 1].toInt() and 0xff) shl 8)
+    }
+
     private val NAME_PATTERN = Regex("^[A-Za-z0-9,.\\[\\]#()!\"';:|_+<>%= \\-]{1,16}$")
 }
+
+data class FirmwareInfo(
+    val firmware: Int,
+    val hardware: Int,
+    val bootloader: Int?,
+)
 
 data class MugSnapshot(
     val name: String? = null,
@@ -101,6 +120,7 @@ data class MugSnapshot(
     val liquidState: Int? = null,
     val firmwareVersion: Int? = null,
     val hardwareVersion: Int? = null,
+    val bootloaderVersion: Int? = null,
     val setupKeyPresent: Boolean? = null,
     val ledRgba: IntArray? = null,
 )

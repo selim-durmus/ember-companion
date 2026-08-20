@@ -54,6 +54,22 @@ class EmberProtocolTest {
     }
 
     @Test
+    fun `firmware payload includes optional bootloader version`() {
+        val info = EmberProtocol.decodeFirmware(byteArrayOf(0x65, 0x01, 0x04, 0x00, 0x21, 0x01))!!
+        assertEquals(357, info.firmware)
+        assertEquals(4, info.hardware)
+        assertEquals(289, info.bootloader)
+    }
+
+    @Test
+    fun `short firmware payload remains compatible`() {
+        val info = EmberProtocol.decodeFirmware(byteArrayOf(0x65, 0x01, 0x04, 0x00))!!
+        assertEquals(357, info.firmware)
+        assertEquals(4, info.hardware)
+        assertEquals(null, info.bootloader)
+    }
+
+    @Test
     fun `temperature unit conversions round trip`() {
         val fahrenheit = EmberProtocol.celsiusToFahrenheit(57.5f)
         assertEquals(135.5f, fahrenheit, 0.001f)

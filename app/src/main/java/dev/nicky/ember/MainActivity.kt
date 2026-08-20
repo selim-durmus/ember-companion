@@ -14,9 +14,9 @@ import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.Bundle
 import android.text.InputType
+import android.text.format.DateUtils
 import android.view.View
 import android.view.WindowManager
-import android.widget.GridLayout
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.TextView
@@ -35,6 +35,7 @@ import androidx.lifecycle.repeatOnLifecycle
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.button.MaterialButtonToggleGroup
 import com.google.android.material.bottomsheet.BottomSheetDialog
+import com.google.android.material.bottomsheet.BottomSheetBehavior
 import com.google.android.material.card.MaterialCardView
 import com.google.android.material.snackbar.Snackbar
 import com.google.android.material.slider.Slider
@@ -48,6 +49,7 @@ import dev.nicky.ember.data.EmberAppState
 import dev.nicky.ember.data.EmberRepository
 import dev.nicky.ember.data.ScanState
 import dev.nicky.ember.data.WritePhase
+import dev.nicky.ember.ui.ColorPaletteView
 import kotlinx.coroutines.launch
 import java.util.Locale
 import java.util.regex.Pattern
@@ -72,6 +74,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var localNicknameButton: MaterialButton
     private lateinit var hardwareNameButton: MaterialButton
     private lateinit var ledColorButton: MaterialButton
+    private lateinit var mugDetailsButton: MaterialButton
     private lateinit var temperatureSlider: Slider
     private lateinit var unitToggle: MaterialButtonToggleGroup
     private lateinit var backgroundMonitoringSwitch: SwitchMaterial
@@ -87,6 +90,7 @@ class MainActivity : AppCompatActivity() {
     private var mugPickerProgress: ProgressBar? = null
     private var mugPickerEmpty: TextView? = null
     private var mugPickerScanButton: MaterialButton? = null
+    private val mugPickerRows = linkedMapOf<String, MaterialCardView>()
     private var transientSheet: BottomSheetDialog? = null
 
     private val bluetoothPermissionLauncher = registerForActivityResult(
@@ -193,6 +197,7 @@ class MainActivity : AppCompatActivity() {
         localNicknameButton = findViewById(R.id.localNicknameButton)
         hardwareNameButton = findViewById(R.id.hardwareNameButton)
         ledColorButton = findViewById(R.id.ledColorButton)
+        mugDetailsButton = findViewById(R.id.mugDetailsButton)
         temperatureSlider = findViewById(R.id.temperatureSlider)
         unitToggle = findViewById(R.id.unitToggle)
         backgroundMonitoringSwitch = findViewById(R.id.backgroundMonitoringSwitch)
@@ -242,6 +247,7 @@ class MainActivity : AppCompatActivity() {
         localNicknameButton.setOnClickListener { showLocalNicknameEditor() }
         hardwareNameButton.setOnClickListener { showHardwareNameEditor() }
         ledColorButton.setOnClickListener { showLedColorPicker() }
+        mugDetailsButton.setOnClickListener { showMugDetails() }
         unitToggle.addOnButtonCheckedListener { _, checkedId, isChecked ->
             if (!isChecked || renderingControls) return@addOnButtonCheckedListener
             viewModel.setDisplayUnit(if (checkedId == R.id.fahrenheitButton) DisplayUnit.FAHRENHEIT else DisplayUnit.CELSIUS)
@@ -300,6 +306,7 @@ class MainActivity : AppCompatActivity() {
         presetButtons.forEach { it.isEnabled = connected && state.writeStatus.phase != WritePhase.WRITING }
         hardwareNameButton.isEnabled = connected
         ledColorButton.isEnabled = connected
+        mugDetailsButton.isEnabled = state.selectedAddress != null
         state.snapshot.ledRgba?.takeIf { it.size >= 3 }?.let { colour ->
             ledColorButton.text = String.format(
                 Locale.US,
@@ -370,6 +377,7 @@ class MainActivity : AppCompatActivity() {
     private fun showMugPicker() {
         if (mugPickerDialog?.isShowing == true) return
         val content = layoutInflater.inflate(R.layout.bottom_sheet_mug_picker, null)
+        mugPickerRows.clear()
         mugPickerList = content.findViewById(R.id.mugPickerList)
         mugPickerStatus = content.findViewById(R.id.mugPickerStatus)
         mugPickerProgress = content.findViewById(R.id.mugPickerProgress)
@@ -390,6 +398,7 @@ class MainActivity : AppCompatActivity() {
             mugPickerProgress = null
             mugPickerEmpty = null
             mugPickerScanButton = null
+            mugPickerRows.clear()
         }
         mugPickerDialog = dialog
         dialog.show()
@@ -399,15 +408,24 @@ class MainActivity : AppCompatActivity() {
 
     private fun updateMugPicker(state: EmberAppState) {
         val list = mugPickerList ?: return
-        list.removeAllViews()
+        val currentAddresses = state.mugChoices.mapTo(mutableSetOf()) { it.candidate.address }
+        mugPickerRows.keys.filterNot(currentAddresses::contains).forEach { address ->
+            mugPickerRows.remove(address)?.let(list::removeView)
+        }
         state.mugChoices.forEach { choice ->
-            val row = layoutInflater.inflate(R.layout.item_mug_choice, list, false) as MaterialCardView
+            // Scan results update RSSI several times per second. Keep the row instance stable
+            // so a touch that starts on it can finish even if state changes before ACTION_UP.
+            val row = mugPickerRows.getOrPut(choice.candidate.address) {
+                (layoutInflater.inflate(R.layout.item_mug_choice, list, false) as MaterialCardView)
+                    .also(list::addView)
+            }
             row.findViewById<TextView>(R.id.mugChoiceName).text = choice.displayName
             row.findViewById<TextView>(R.id.mugChoiceStatus).apply {
                 text = when {
                     choice.connected -> getString(R.string.mug_status_connected)
-                    choice.selected -> getString(R.string.mug_status_selected)
+                    choice.selected && choice.candidate.bonded -> getString(R.string.mug_status_selected)
                     choice.candidate.bonded -> getString(R.string.mug_status_paired)
+                    choice.candidate.rssi != null -> getString(R.string.mug_status_pair_to_connect)
                     else -> getString(R.string.mug_status_saved)
                 }
                 setTextColor(
@@ -441,7 +459,6 @@ class MainActivity : AppCompatActivity() {
                 if (!choice.connected) viewModel.selectMug(choice.candidate.address)
                 mugPickerDialog?.dismiss()
             }
-            list.addView(row)
         }
         mugPickerEmpty?.visibility = if (state.mugChoices.isEmpty()) android.view.View.VISIBLE else android.view.View.GONE
         val scanning = state.scanState == ScanState.SCANNING
@@ -572,46 +589,132 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun showLedColorPicker() {
-        val palette = listOf(
-            LedChoice("Ember orange", 245, 130, 85),
-            LedChoice("Blue", 70, 120, 255),
-            LedChoice("Green", 80, 200, 130),
-            LedChoice("Purple", 170, 90, 255),
-            LedChoice("Pink", 255, 90, 160),
-            LedChoice("Red", 255, 65, 65),
-            LedChoice("White", 255, 255, 255),
-        )
-        val current = latestState.snapshot.ledRgba?.takeIf { it.size >= 3 }?.let {
-            LedChoice(getString(R.string.current_colour), it[0], it[1], it[2])
-        }
-        val colours = buildList {
-            if (current != null && palette.none { it.sameColour(current) }) add(current)
-            addAll(palette)
-        }
         val content = layoutInflater.inflate(R.layout.bottom_sheet_led_picker, null)
-        val grid = content.findViewById<GridLayout>(R.id.ledChoiceGrid)
+        val palette = content.findViewById<ColorPaletteView>(R.id.ledColorPalette)
+        val brightnessSlider = content.findViewById<Slider>(R.id.ledBrightnessSlider)
+        val brightnessLabel = content.findViewById<TextView>(R.id.ledBrightnessLabel)
+        val preview = content.findViewById<View>(R.id.ledColourPreview)
+        val hex = content.findViewById<TextView>(R.id.ledColourHex)
         val dialog = BottomSheetDialog(this).apply { setContentView(content) }
-        colours.forEach { colour ->
-            val row = layoutInflater.inflate(R.layout.item_led_choice, grid, false) as MaterialCardView
-            row.findViewById<View>(R.id.ledChoiceSwatch).background = GradientDrawable().apply {
+
+        val current = latestState.snapshot.ledRgba?.takeIf { it.size >= 3 } ?: intArrayOf(245, 130, 85)
+        palette.setColor(current[0], current[1], current[2])
+        brightnessSlider.value = palette.brightness
+
+        var selectedColor = palette.selectedColor
+        fun renderSelection(color: Int) {
+            selectedColor = color
+            preview.background = GradientDrawable().apply {
                 shape = GradientDrawable.OVAL
-                setColor(Color.rgb(colour.red, colour.green, colour.blue))
-                setStroke(resources.getDimensionPixelSize(R.dimen.mug_card_stroke), ContextCompat.getColor(this@MainActivity, R.color.ember_outline))
+                setColor(color)
+                setStroke(
+                    resources.getDimensionPixelSize(R.dimen.mug_card_stroke),
+                    ContextCompat.getColor(this@MainActivity, R.color.ember_outline),
+                )
             }
-            row.findViewById<TextView>(R.id.ledChoiceName).text = colour.name
-            row.findViewById<TextView>(R.id.ledChoiceHex).text = colour.hex
-            val selected = current?.sameColour(colour) == true
-            row.findViewById<TextView>(R.id.ledChoiceCheck).visibility = if (selected) View.VISIBLE else View.INVISIBLE
-            row.strokeColor = ContextCompat.getColor(this, if (selected) R.color.ember_copper else R.color.ember_outline)
-            row.strokeWidth = resources.getDimensionPixelSize(if (selected) R.dimen.mug_card_selected_stroke else R.dimen.mug_card_stroke)
-            row.setOnClickListener {
-                viewModel.setLedColor(colour.red, colour.green, colour.blue)
-                dialog.dismiss()
-            }
-            grid.addView(row)
+            hex.text = String.format(
+                Locale.US,
+                "#%02X%02X%02X",
+                Color.red(color),
+                Color.green(color),
+                Color.blue(color),
+            )
+            brightnessLabel.text = getString(R.string.led_brightness_value, (palette.brightness * 100).toInt())
         }
-        content.findViewById<MaterialButton>(R.id.ledPickerDoneButton).setOnClickListener { dialog.dismiss() }
+
+        palette.onColorChanged = ::renderSelection
+        brightnessSlider.addOnChangeListener { _, value, _ -> palette.setBrightness(value) }
+        renderSelection(selectedColor)
+        content.findViewById<MaterialButton>(R.id.ledPickerCancelButton).setOnClickListener { dialog.dismiss() }
+        content.findViewById<MaterialButton>(R.id.ledApplyButton).setOnClickListener {
+            viewModel.setLedColor(Color.red(selectedColor), Color.green(selectedColor), Color.blue(selectedColor))
+            dialog.dismiss()
+        }
         showTransientSheet(dialog)
+    }
+
+    private fun showMugDetails() {
+        val state = latestState
+        val content = layoutInflater.inflate(R.layout.bottom_sheet_mug_details, null)
+        val list = content.findViewById<LinearLayout>(R.id.mugDetailsList)
+        content.findViewById<TextView>(R.id.mugDetailsSubtitle).text = getString(
+            if (state.connected && state.snapshotFresh) R.string.mug_details_live else R.string.mug_details_cached,
+        )
+
+        val snapshot = state.snapshot
+        val profile = state.selectedProfile
+        val unavailable = getString(R.string.not_available)
+        addMugDetail(list, R.string.detail_local_nickname, profile?.nickname?.takeIf(String::isNotBlank) ?: unavailable)
+        addMugDetail(list, R.string.detail_mug_name, snapshot.name?.takeIf(String::isNotBlank) ?: unavailable)
+        addMugDetail(list, R.string.detail_ble_address, state.selectedAddress ?: unavailable)
+        addMugDetail(list, R.string.detail_connection, state.connectionDetail)
+        addMugDetail(list, R.string.detail_last_sync, formatLastSync(state.snapshotUpdatedAt))
+        addMugDetail(
+            list,
+            R.string.detail_battery,
+            snapshot.batteryPercent?.let { percent ->
+                if (snapshot.charging == true) "$percent% · charging" else "$percent%"
+            } ?: unavailable,
+        )
+        addMugDetail(
+            list,
+            R.string.detail_drink,
+            buildString {
+                append(EmberProtocol.liquidStateLabel(snapshot.liquidState))
+                snapshot.liquidLevel?.let { level -> append(if (level == 0) " · empty" else " · $level / 30") }
+            },
+        )
+        addMugDetail(
+            list,
+            R.string.detail_led_colour,
+            snapshot.ledRgba?.takeIf { it.size >= 3 }?.let { colour ->
+                String.format(Locale.US, "#%02X%02X%02X", colour[0], colour[1], colour[2])
+            } ?: unavailable,
+        )
+        addMugDetail(list, R.string.detail_firmware, snapshot.firmwareVersion?.toString() ?: unavailable)
+        addMugDetail(list, R.string.detail_hardware, snapshot.hardwareVersion?.toString() ?: unavailable)
+        addMugDetail(list, R.string.detail_bootloader, snapshot.bootloaderVersion?.toString() ?: unavailable)
+        addMugDetail(
+            list,
+            R.string.detail_control_access,
+            when (snapshot.setupKeyPresent) {
+                true -> getString(R.string.control_access_ready)
+                false -> getString(R.string.control_access_missing)
+                null -> unavailable
+            },
+        )
+
+        val dialog = BottomSheetDialog(this).apply { setContentView(content) }
+        dialog.setOnShowListener {
+            dialog.findViewById<View>(com.google.android.material.R.id.design_bottom_sheet)?.let { sheet ->
+                sheet.layoutParams = sheet.layoutParams.apply {
+                    height = (resources.displayMetrics.heightPixels * 0.9f).toInt()
+                }
+                BottomSheetBehavior.from(sheet).state = BottomSheetBehavior.STATE_EXPANDED
+            }
+        }
+        content.findViewById<MaterialButton>(R.id.mugDetailsDoneButton).setOnClickListener { dialog.dismiss() }
+        showTransientSheet(dialog)
+    }
+
+    private fun addMugDetail(container: LinearLayout, labelRes: Int, value: String) {
+        val row = layoutInflater.inflate(R.layout.item_mug_detail, container, false)
+        row.findViewById<TextView>(R.id.mugDetailLabel).setText(labelRes)
+        row.findViewById<TextView>(R.id.mugDetailValue).text = value
+        container.addView(row)
+    }
+
+    private fun formatLastSync(timestamp: Long): String {
+        if (timestamp <= 0L) return getString(R.string.never_synced)
+        if (System.currentTimeMillis() - timestamp < DateUtils.MINUTE_IN_MILLIS) {
+            return getString(R.string.just_now)
+        }
+        return DateUtils.getRelativeTimeSpanString(
+            timestamp,
+            System.currentTimeMillis(),
+            DateUtils.MINUTE_IN_MILLIS,
+            DateUtils.FORMAT_ABBREV_RELATIVE,
+        ).toString()
     }
 
     private fun showPresetEditor() {
@@ -746,10 +849,4 @@ class MainActivity : AppCompatActivity() {
         return if (compact) "$number°" else "$number $suffix"
     }
 
-    private data class LedChoice(val name: String, val red: Int, val green: Int, val blue: Int) {
-        val hex: String
-            get() = String.format(Locale.US, "#%02X%02X%02X", red, green, blue)
-
-        fun sameColour(other: LedChoice): Boolean = red == other.red && green == other.green && blue == other.blue
-    }
 }

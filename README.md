@@ -12,6 +12,7 @@ Current MVP scope:
 - switch between Celsius and Fahrenheit and save three presets
 - turn the heater off
 - customize the hardware mug name and identification LED colour
+- inspect live and cached mug details, including firmware, hardware, bootloader, and control access
 - optionally keep monitoring in the background and notify when a drink is ready
 - use a home-screen widget and Quick Settings tile for common actions
 - subscribe to mug push events and refresh changed values

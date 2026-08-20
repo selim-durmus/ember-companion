@@ -384,6 +384,13 @@
                     android:layout_height="wrap_content"
                     android:text="@string/change_led_color" />
 
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/mugDetailsButton"
+                    style="@style/Widget.Material3.Button.OutlinedButton"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="@string/mug_details" />
+
                 <com.google.android.material.switchmaterial.SwitchMaterial
                     android:id="@+id/backgroundMonitoringSwitch"
                     android:layout_width="match_parent"

@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
     android:background="@drawable/bottom_sheet_background"
@@ -32,12 +33,12 @@
             android:textStyle="bold" />
 
         <com.google.android.material.button.MaterialButton
-            android:id="@+id/ledPickerDoneButton"
+            android:id="@+id/ledPickerCancelButton"
             style="@style/Widget.Material3.Button.TextButton"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:minWidth="0dp"
-            android:text="@string/done"
+            android:text="@string/cancel"
             android:textColor="@color/ember_copper_dark" />
     </LinearLayout>
 
@@ -51,13 +52,83 @@
         android:textColor="@color/ember_sage"
         android:textSize="14sp" />
 
-    <GridLayout
-        android:id="@+id/ledChoiceGrid"
+    <dev.nicky.ember.ui.ColorPaletteView
+        android:id="@+id/ledColorPalette"
+        android:layout_width="match_parent"
+        android:layout_height="190dp"
+        android:layout_marginStart="6dp"
+        android:layout_marginTop="18dp"
+        android:layout_marginEnd="6dp" />
+
+    <TextView
+        android:id="@+id/ledBrightnessLabel"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginTop="12dp"
-        android:alignmentMode="alignMargins"
-        android:columnCount="2"
-        android:useDefaultMargins="false" />
+        android:layout_marginStart="6dp"
+        android:layout_marginTop="16dp"
+        android:layout_marginEnd="6dp"
+        android:text="@string/led_brightness"
+        android:textColor="@color/ember_ink"
+        android:textSize="14sp"
+        android:textStyle="bold" />
+
+    <com.google.android.material.slider.Slider
+        android:id="@+id/ledBrightnessSlider"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="-2dp"
+        android:layout_marginEnd="-2dp"
+        android:stepSize="0"
+        android:value="1"
+        android:valueFrom="0.1"
+        android:valueTo="1"
+        app:labelBehavior="gone" />
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="6dp"
+        android:layout_marginTop="8dp"
+        android:layout_marginEnd="6dp"
+        android:gravity="center_vertical"
+        android:orientation="horizontal">
+
+        <View
+            android:id="@+id/ledColourPreview"
+            android:layout_width="48dp"
+            android:layout_height="48dp" />
+
+        <LinearLayout
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="12dp"
+            android:layout_weight="1"
+            android:orientation="vertical">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="@string/selected_colour"
+                android:textColor="@color/ember_sage"
+                android:textSize="11sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/ledColourHex"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="2dp"
+                android:text="#F58255"
+                android:textColor="@color/ember_ink"
+                android:textSize="18sp"
+                android:textStyle="bold" />
+        </LinearLayout>
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/ledApplyButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/apply_colour" />
+    </LinearLayout>
 
 </LinearLayout>

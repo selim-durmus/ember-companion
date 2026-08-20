@@ -101,6 +101,7 @@ class EmberBleClient(
     private var manualDisconnect = false
     private var retryCount = 0
     private var retryRunnable: Runnable? = null
+    private var pairingTimeout: Runnable? = null
     private var sessionGeneration = 0L
     private var closed = false
 
@@ -231,10 +232,20 @@ class EmberBleClient(
             beginIntentionalTransition()
             closeCurrentGatt()
             selectedDevice = device
-            changeState(ConnectionState.PAIRING, "Approve Android's pairing request")
-            log("Starting LE bond with ${device.safeLabel()}")
-            if (!device.createBond()) {
-                changeState(ConnectionState.DISCONNECTED, "Could not start pairing")
+            // beginIntentionalTransition marks callbacks from the previous GATT session as
+            // manual. Pairing is a new active session, so its bond broadcasts must not be
+            // discarded as manual-disconnect callbacks.
+            manualDisconnect = false
+            changeState(ConnectionState.PAIRING, "Pairing… keep the mug pulsing blue and approve any Android prompt")
+            schedulePairingTimeout(device)
+            if (device.bondState == BluetoothDevice.BOND_BONDING) {
+                log("Waiting for the in-progress LE bond with ${device.safeLabel()}")
+            } else {
+                log("Starting LE bond with ${device.safeLabel()}")
+                if (!device.createBond()) {
+                    cancelPairingTimeout()
+                    changeState(ConnectionState.DISCONNECTED, "Could not start pairing")
+                }
             }
         }
     }
@@ -308,6 +319,7 @@ class EmberBleClient(
     private fun connect(device: BluetoothDevice, resetRetryCount: Boolean = true) {
         if (closed || !hasPermissions()) return
         stopScan(notify = false)
+        cancelPairingTimeout()
         cancelRetry()
         sessionGeneration += 1
         manualDisconnect = false
@@ -515,10 +527,13 @@ class EmberBleClient(
                 charging = value.getOrNull(1)?.toInt() == 1,
             )
             EmberProtocol.LIQUID_STATE -> snapshot.copy(liquidState = value.firstOrNull()?.toInt()?.and(0xff))
-            EmberProtocol.FIRMWARE -> snapshot.copy(
-                firmwareVersion = littleEndianU16(value, 0),
-                hardwareVersion = littleEndianU16(value, 2),
-            )
+            EmberProtocol.FIRMWARE -> EmberProtocol.decodeFirmware(value)?.let { info ->
+                snapshot.copy(
+                    firmwareVersion = info.firmware,
+                    hardwareVersion = info.hardware,
+                    bootloaderVersion = info.bootloader,
+                )
+            } ?: snapshot
             EmberProtocol.UDSK -> snapshot.copy(setupKeyPresent = value.any { it.toInt() != 0 })
             EmberProtocol.LED -> snapshot.copy(ledRgba = value.take(4).map { it.toInt() and 0xff }.toIntArray())
             else -> snapshot
@@ -695,9 +710,37 @@ class EmberBleClient(
         retryRunnable = null
     }
 
+    @SuppressLint("MissingPermission")
+    private fun schedulePairingTimeout(device: BluetoothDevice) {
+        cancelPairingTimeout()
+        pairingTimeout = Runnable {
+            pairingTimeout = null
+            if (
+                closed || manualDisconnect || state != ConnectionState.PAIRING ||
+                selectedDevice?.address != device.address
+            ) return@Runnable
+            if (device.bondState == BluetoothDevice.BOND_BONDED) {
+                log("Bluetooth bond established before pairing timeout")
+                connect(device)
+            } else {
+                changeState(
+                    ConnectionState.DISCONNECTED,
+                    "Pairing timed out. Put the mug in pairing mode until it pulses blue, then try again",
+                )
+                log("Bluetooth pairing timed out")
+            }
+        }.also { handler.postDelayed(it, PAIRING_TIMEOUT_MS) }
+    }
+
+    private fun cancelPairingTimeout() {
+        pairingTimeout?.let(handler::removeCallbacks)
+        pairingTimeout = null
+    }
+
     private fun beginIntentionalTransition() {
         manualDisconnect = true
         sessionGeneration += 1
+        cancelPairingTimeout()
         cancelRetry()
     }
 
@@ -732,7 +775,10 @@ class EmberBleClient(
             context,
             bondReceiver,
             IntentFilter(BluetoothDevice.ACTION_BOND_STATE_CHANGED),
-            ContextCompat.RECEIVER_NOT_EXPORTED,
+            // Bluetooth broadcasts can originate from the privileged Bluetooth stack app,
+            // not only the system UID. Android requires an exported dynamic receiver for
+            // those broadcasts; the action itself is a protected system broadcast.
+            ContextCompat.RECEIVER_EXPORTED,
         )
         receiverRegistered = true
     }
@@ -749,11 +795,20 @@ class EmberBleClient(
             if (state != ConnectionState.PAIRING || manualDisconnect) return
             when (intent.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE, BluetoothDevice.ERROR)) {
                 BluetoothDevice.BOND_BONDED -> {
+                    cancelPairingTimeout()
+                    scanResults[device.address]?.let { scanResults[device.address] = it.copy(bonded = true) }
+                    emitCandidates()
                     log("Bluetooth bond established")
                     connect(device)
                 }
                 BluetoothDevice.BOND_NONE -> {
-                    changeState(ConnectionState.DISCONNECTED, "Pairing was cancelled or failed")
+                    cancelPairingTimeout()
+                    scanResults[device.address]?.let { scanResults[device.address] = it.copy(bonded = false) }
+                    emitCandidates()
+                    changeState(
+                        ConnectionState.DISCONNECTED,
+                        "Pairing failed. Put the mug in pairing mode until it pulses blue, then try again",
+                    )
                     log("Bluetooth bond was not established")
                 }
             }
@@ -775,11 +830,6 @@ class EmberBleClient(
     )
 
     private fun shortUuid(uuid: UUID): String = uuid.toString().substring(4, 8)
-
-    private fun littleEndianU16(value: ByteArray, offset: Int): Int? {
-        if (value.size < offset + 2) return null
-        return (value[offset].toInt() and 0xff) or ((value[offset + 1].toInt() and 0xff) shl 8)
-    }
 
     private fun rememberAddress(address: String) {
         val addresses = preferences.getStringSet(PREF_KNOWN_ADDRESSES, emptySet()).orEmpty().toMutableSet()
@@ -805,6 +855,7 @@ class EmberBleClient(
         const val SCAN_DURATION_MS = 8_000L
         const val RETRY_DELAY_MS = 1_200L
         const val OPERATION_TIMEOUT_MS = 8_000L
+        const val PAIRING_TIMEOUT_MS = 30_000L
         const val MAX_RETRIES = 3
     }
 }

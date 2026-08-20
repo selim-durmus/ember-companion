@@ -68,6 +68,15 @@ class EmberPreferences(context: Context) {
             snapshot.charging?.let { putBoolean(key(address, "charging"), it) }
             snapshot.liquidLevel?.let { putInt(key(address, "level"), it) }
             snapshot.liquidState?.let { putInt(key(address, "state"), it) }
+            snapshot.firmwareVersion?.let { putInt(key(address, "firmware"), it) }
+            snapshot.hardwareVersion?.let { putInt(key(address, "hardware"), it) }
+            snapshot.bootloaderVersion?.let { putInt(key(address, "bootloader"), it) }
+            snapshot.setupKeyPresent?.let { putBoolean(key(address, "setup_key"), it) }
+            snapshot.ledRgba?.takeIf { it.size >= 3 }?.let { colour ->
+                putInt(key(address, "led_red"), colour[0])
+                putInt(key(address, "led_green"), colour[1])
+                putInt(key(address, "led_blue"), colour[2])
+            }
             putLong(key(address, "snapshot_time"), System.currentTimeMillis())
         }
     }
@@ -82,6 +91,11 @@ class EmberPreferences(context: Context) {
             batteryPercent = intOrNull(key(address, "battery")),
             charging = booleanOrNull(key(address, "charging")),
             liquidState = intOrNull(key(address, "state")),
+            firmwareVersion = intOrNull(key(address, "firmware")),
+            hardwareVersion = intOrNull(key(address, "hardware")),
+            bootloaderVersion = intOrNull(key(address, "bootloader")),
+            setupKeyPresent = booleanOrNull(key(address, "setup_key")),
+            ledRgba = cachedLedColour(address),
         )
         return snapshot to preferences.getLong(key(address, "snapshot_time"), 0L)
     }
@@ -93,6 +107,13 @@ class EmberPreferences(context: Context) {
     private fun intOrNull(key: String): Int? = if (preferences.contains(key)) preferences.getInt(key, 0) else null
 
     private fun booleanOrNull(key: String): Boolean? = if (preferences.contains(key)) preferences.getBoolean(key, false) else null
+
+    private fun cachedLedColour(address: String): IntArray? {
+        val red = intOrNull(key(address, "led_red")) ?: return null
+        val green = intOrNull(key(address, "led_green")) ?: return null
+        val blue = intOrNull(key(address, "led_blue")) ?: return null
+        return intArrayOf(red, green, blue, 255)
+    }
 
     private fun key(address: String, suffix: String): String = "mug_${address.replace(':', '_')}_$suffix"
 
