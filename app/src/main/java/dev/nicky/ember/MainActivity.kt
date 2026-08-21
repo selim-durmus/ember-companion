@@ -150,11 +150,17 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    override fun onStart() {
+        super.onStart()
+        viewModel.setAppVisible(true)
+    }
+
     override fun onStop() {
         mugPickerDialog?.dismiss()
         mugPickerDialog = null
         transientSheet?.dismiss()
         transientSheet = null
+        if (!isChangingConfigurations) viewModel.setAppVisible(false)
         super.onStop()
     }
 

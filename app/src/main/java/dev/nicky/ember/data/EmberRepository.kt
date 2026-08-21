@@ -1,6 +1,7 @@
 package dev.nicky.ember.data
 
 import android.content.Context
+import dev.nicky.ember.BackgroundMonitoringPolicy
 import dev.nicky.ember.EmberConnectionService
 import dev.nicky.ember.EmberWidgetProvider
 import dev.nicky.ember.ble.BleWritePhase
@@ -42,12 +43,17 @@ class EmberRepository(private val context: Context) : EmberBleClient.Listener {
 
     private var started = false
     private var pendingTargetAfterConnect: Float? = null
+    @Volatile private var appVisible = false
 
     fun start(): Boolean {
         if (started) return false
         started = true
         refreshKnownMugs(client.knownMugs())
-        if (_state.value.backgroundMonitoring) EmberConnectionService.setEnabled(context, true)
+        if (BackgroundMonitoringPolicy.shouldRunService(_state.value)) {
+            EmberConnectionService.setEnabled(context, true)
+        } else if (_state.value.backgroundMonitoring && BackgroundMonitoringPolicy.isKnownEmpty(_state.value)) {
+            EmberConnectionService.pauseForEmptyMug(context)
+        }
         return true
     }
 
@@ -123,8 +129,34 @@ class EmberRepository(private val context: Context) : EmberBleClient.Listener {
     fun setBackgroundMonitoring(enabled: Boolean) {
         preferences.setBackgroundMonitoring(enabled)
         _state.update { it.copy(backgroundMonitoring = enabled) }
-        EmberConnectionService.setEnabled(context, enabled)
+        if (enabled && BackgroundMonitoringPolicy.isKnownEmpty(_state.value)) {
+            EmberConnectionService.pauseForEmptyMug(context)
+        } else {
+            EmberConnectionService.setEnabled(context, enabled && BackgroundMonitoringPolicy.shouldRunService(_state.value))
+        }
         publishExternalState()
+    }
+
+    fun setAppVisible(visible: Boolean) {
+        appVisible = visible
+        val state = _state.value
+        if (!state.backgroundMonitoring) return
+
+        if (visible) {
+            if (state.connectionState == ConnectionState.DISCONNECTED && client.hasPermissions()) {
+                client.connectPreferred()
+            }
+            if (BackgroundMonitoringPolicy.isKnownEmpty(state)) {
+                EmberConnectionService.pauseForEmptyMug(context)
+            } else {
+                EmberConnectionService.setEnabled(context, BackgroundMonitoringPolicy.shouldRunService(state))
+            }
+        } else if (BackgroundMonitoringPolicy.isKnownEmpty(state)) {
+            EmberConnectionService.pauseForEmptyMug(context)
+            if (state.connectionState != ConnectionState.DISCONNECTED) client.disconnect()
+        } else {
+            EmberConnectionService.setEnabled(context, true)
+        }
     }
 
     override fun onConnectionStateChanged(state: ConnectionState, detail: String, selectedAddress: String?) {
@@ -161,6 +193,7 @@ class EmberRepository(private val context: Context) : EmberBleClient.Listener {
     }
 
     override fun onSnapshotChanged(address: String, snapshot: MugSnapshot) {
+        val previousLiquidState = _state.value.snapshot.liquidState
         val hasData = snapshot.name != null || snapshot.currentTemperatureC != null || snapshot.batteryPercent != null
         if (hasData) preferences.persistSnapshot(address, snapshot)
         snapshot.name?.let { preferences.rememberCandidate(address, it, null) }
@@ -175,6 +208,18 @@ class EmberRepository(private val context: Context) : EmberBleClient.Listener {
         }
         refreshProfilesAndChoices()
         publishExternalState()
+
+        val state = _state.value
+        if (BackgroundMonitoringPolicy.isLiveEmpty(state)) {
+            EmberConnectionService.pauseForEmptyMug(context)
+            if (previousLiquidState != 1) appendLog("Background monitoring paused while the mug is empty")
+            if (!appVisible) client.disconnect()
+        } else if (
+            state.backgroundMonitoring &&
+            BackgroundMonitoringPolicy.isRefill(previousLiquidState, snapshot.liquidState)
+        ) {
+            EmberConnectionService.setEnabled(context, true)
+        }
     }
 
     override fun onMugCandidates(candidates: List<MugCandidate>) {

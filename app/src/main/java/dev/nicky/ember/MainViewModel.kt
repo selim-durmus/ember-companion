@@ -25,4 +25,5 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun setHardwareName(name: String) = repository.setHardwareName(name)
     fun setLedColor(red: Int, green: Int, blue: Int) = repository.setLedColor(red, green, blue)
     fun setBackgroundMonitoring(enabled: Boolean) = repository.setBackgroundMonitoring(enabled)
+    fun setAppVisible(visible: Boolean) = repository.setAppVisible(visible)
 }

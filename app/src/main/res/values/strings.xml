@@ -51,7 +51,7 @@
     <string name="never_synced">Never synced</string>
     <string name="just_now">Just now</string>
     <string name="background_monitoring">Notify me when my drink is ready</string>
-    <string name="background_monitoring_detail">Keeps the mug connection active in the background while enabled.</string>
+    <string name="background_monitoring_detail">Keeps the mug connected while your drink is in use, then pauses automatically when it is empty.</string>
     <string name="choose_ember_mug">Choose an Ember mug</string>
     <string name="add_new_mug">Add a new mug</string>
     <string name="scan_again">Scan again</string>

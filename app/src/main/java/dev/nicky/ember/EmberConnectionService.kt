@@ -13,7 +13,6 @@ import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleService
 import androidx.lifecycle.lifecycleScope
-import dev.nicky.ember.ble.EmberProtocol
 import dev.nicky.ember.data.DisplayUnit
 import dev.nicky.ember.data.EmberAppState
 import dev.nicky.ember.data.EmberRepository
@@ -63,11 +62,11 @@ class EmberConnectionService : LifecycleService() {
     override fun onDestroy() {
         if (foregroundStarted) stopForeground(STOP_FOREGROUND_REMOVE)
         foregroundStarted = false
+        notificationManager.cancel(ONGOING_NOTIFICATION_ID)
         super.onDestroy()
     }
 
     private fun handleState(state: EmberAppState) {
-        if (foregroundStarted) notificationManager.notify(ONGOING_NOTIFICATION_ID, ongoingNotification(state))
         val hasLiveSnapshot = state.connected && state.snapshotFresh
         val decision = readyNotificationGate.update(
             mugAddress = state.snapshotAddress ?: state.selectedAddress,
@@ -77,6 +76,17 @@ class EmberConnectionService : LifecycleService() {
         )
         if (decision.stateChanged) persistReadyNotificationGate()
         if (decision.shouldNotify) notifyReady(state)
+        if (BackgroundMonitoringPolicy.isLiveEmpty(state)) {
+            notificationManager.cancel(READY_NOTIFICATION_ID)
+            if (foregroundStarted) stopForeground(STOP_FOREGROUND_REMOVE)
+            foregroundStarted = false
+            notificationManager.cancel(ONGOING_NOTIFICATION_ID)
+            stopSelf()
+            EmberWidgetProvider.updateAll(this, state)
+            EmberTileService.requestUpdate(this)
+            return
+        }
+        if (foregroundStarted) notificationManager.notify(ONGOING_NOTIFICATION_ID, ongoingNotification(state))
         EmberWidgetProvider.updateAll(this, state)
         EmberTileService.requestUpdate(this)
     }
@@ -115,7 +125,7 @@ class EmberConnectionService : LifecycleService() {
     private fun ongoingNotification(state: EmberAppState) = NotificationCompat.Builder(this, CHANNEL_CONNECTION)
         .setSmallIcon(R.drawable.ic_mug_notification)
         .setContentTitle(state.selectedProfile?.displayName ?: state.snapshot.name ?: getString(R.string.app_name))
-        .setContentText(connectionSummary(state))
+        .setContentText(OngoingNotificationText.summary(state))
         .setContentIntent(openAppPendingIntent())
         .setOngoing(true)
         .setOnlyAlertOnce(true)
@@ -147,13 +157,6 @@ class EmberConnectionService : LifecycleService() {
             .setCategory(NotificationCompat.CATEGORY_STATUS)
             .build()
         notificationManager.notify(READY_NOTIFICATION_ID, notification)
-    }
-
-    private fun connectionSummary(state: EmberAppState): String {
-        if (!state.connected) return state.connectionDetail
-        val current = state.snapshot.currentTemperatureC?.let { formatTemperature(it, state.displayUnit) }
-        val label = EmberProtocol.liquidStateLabel(state.snapshot.liquidState)
-        return listOfNotNull(current, label).joinToString(" · ").ifBlank { "Connected" }
     }
 
     private fun formatTemperature(celsius: Float, unit: DisplayUnit): String {
@@ -209,6 +212,14 @@ class EmberConnectionService : LifecycleService() {
             } else {
                 context.stopService(intent)
             }
+        }
+
+        fun pauseForEmptyMug(context: Context) {
+            context.getSystemService(NotificationManager::class.java).apply {
+                cancel(READY_NOTIFICATION_ID)
+                cancel(ONGOING_NOTIFICATION_ID)
+            }
+            context.stopService(Intent(context, EmberConnectionService::class.java))
         }
     }
 }
