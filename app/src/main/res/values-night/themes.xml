@@ -1,0 +1,8 @@
+<resources>
+    <style name="Theme.EmberCompanion" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/ember_background</item>
+        <item name="android:windowSplashScreenBackground">@color/ember_background</item>
+        <item name="android:windowSplashScreenAnimatedIcon">@drawable/ic_launcher_foreground</item>
+        <item name="android:windowSplashScreenIconBackgroundColor">@color/ember_icon_background</item>
+    </style>
+</resources>

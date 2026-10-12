@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Centered inside the 66dp adaptive-icon safe zone, handle included. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Steam -->
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M43,35c-3.2,-2.6 3.2,-4.8 0,-8.5M53,35c-3.2,-2.6 3.2,-4.8 0,-8.5"
+        android:strokeAlpha="0.85"
+        android:strokeColor="#FFF2B79A"
+        android:strokeLineCap="round"
+        android:strokeWidth="3" />
+    <!-- Handle -->
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M63,47h3a7,7 0,0 1,7 7v4a7,7 0,0 1,-7 7h-3"
+        android:strokeColor="#FFF6E7DC"
+        android:strokeLineCap="round"
+        android:strokeWidth="5" />
+    <!-- Body -->
+    <path android:pathData="M33,40h30v30a8,8 0,0 1,-8 8h-14a8,8 0,0 1,-8 -8z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:endX="63"
+                android:endY="40"
+                android:startX="33"
+                android:startY="40"
+                android:type="linear">
+                <item android:color="#FFFFF8F1" android:offset="0" />
+                <item android:color="#FFF1DED1" android:offset="1" />
+            </gradient>
+        </aapt:attr>
+    </path>
+    <!-- Rim shadow -->
+    <path
+        android:fillColor="#1F3A1A0E"
+        android:pathData="M33,40h30v3h-30z" />
+    <!-- LED glow -->
+    <path
+        android:fillColor="#40FF8A50"
+        android:pathData="M42,71.5a6,3.5 0,1 0,12 0a6,3.5 0,1 0,-12 0z" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M45,71.5h6"
+        android:strokeColor="#FFFF7A3D"
+        android:strokeLineCap="round"
+        android:strokeWidth="2.6" />
+</vector>

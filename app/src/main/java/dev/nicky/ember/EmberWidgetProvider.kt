@@ -6,95 +6,53 @@ import android.appwidget.AppWidgetProvider
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.view.View
 import android.widget.RemoteViews
-import dev.nicky.ember.data.DisplayUnit
-import dev.nicky.ember.data.EmberAppState
-import dev.nicky.ember.data.EmberRepository
-import java.util.Locale
+import dev.nicky.ember.data.QuickAction
 
 class EmberWidgetProvider : AppWidgetProvider() {
     override fun onUpdate(context: Context, appWidgetManager: AppWidgetManager, appWidgetIds: IntArray) {
         val state = (context.applicationContext as EmberApplication).repository.state.value
-        appWidgetIds.forEach { appWidgetManager.updateAppWidget(it, remoteViews(context, state)) }
-    }
-
-    override fun onReceive(context: Context, intent: Intent) {
-        super.onReceive(context, intent)
-        val repository = (context.applicationContext as EmberApplication).repository
-        when (intent.action) {
-            ACTION_REFRESH -> if (repository.state.value.connected) repository.refresh() else repository.connectPreferred()
-            ACTION_HEATER_OFF -> repository.setTargetTemperature(0f)
-            ACTION_PRESET -> repository.state.value.presetsCelsius.getOrNull(1)?.let(repository::setTargetTemperature)
-        }
-        if (intent.action in setOf(ACTION_REFRESH, ACTION_HEATER_OFF, ACTION_PRESET)) {
-            updateAll(context, repository.state.value)
-        }
+        val views = remoteViews(context, ExternalState.from(state))
+        appWidgetIds.forEach { appWidgetManager.updateAppWidget(it, views) }
     }
 
     companion object {
-        private const val ACTION_REFRESH = "dev.nicky.ember.widget.REFRESH"
-        private const val ACTION_HEATER_OFF = "dev.nicky.ember.widget.HEATER_OFF"
-        private const val ACTION_PRESET = "dev.nicky.ember.widget.PRESET"
-
-        fun updateAll(context: Context, state: EmberAppState) {
-            val manager = AppWidgetManager.getInstance(context)
-            val component = ComponentName(context, EmberWidgetProvider::class.java)
-            manager.getAppWidgetIds(component).forEach { manager.updateAppWidget(it, remoteViews(context, state)) }
+        internal fun updateAll(context: Context, state: ExternalState) {
+            val manager = AppWidgetManager.getInstance(context) ?: return
+            val ids = manager.getAppWidgetIds(ComponentName(context, EmberWidgetProvider::class.java))
+            if (ids.isEmpty()) return
+            val views = remoteViews(context, state)
+            ids.forEach { manager.updateAppWidget(it, views) }
         }
 
-        private fun remoteViews(context: Context, state: EmberAppState): RemoteViews {
+        private fun remoteViews(context: Context, state: ExternalState): RemoteViews {
             val views = RemoteViews(context.packageName, R.layout.widget_ember)
-            val name = state.selectedProfile?.displayName ?: state.snapshot.name ?: "Ember"
-            val current = state.snapshot.currentTemperatureC?.let { formatTemperature(it, state.displayUnit) } ?: "—"
-            val target = state.snapshot.targetTemperatureC?.let {
-                if (it == 0f) "Off" else formatTemperature(it, state.displayUnit)
-            } ?: "—"
-            views.setTextViewText(R.id.widgetMugName, name)
-            views.setTextViewText(R.id.widgetCurrentTemperature, current)
-            views.setTextViewText(R.id.widgetTarget, "Target $target")
+            views.setTextViewText(R.id.widgetMugName, state.name)
+            views.setTextViewText(R.id.widgetCurrentTemperature, state.current ?: "—")
             views.setTextViewText(
-                R.id.widgetStatus,
-                if (state.connected) state.connectionDetail else if (state.snapshotUpdatedAt > 0) "Last known" else "Disconnected",
+                R.id.widgetTarget,
+                state.target?.let { context.getString(R.string.widget_target, it) } ?: context.getString(R.string.widget_target_unknown),
             )
-            val openApp = activityIntent(context)
-            views.setOnClickPendingIntent(R.id.widgetRoot, openApp)
-            views.setOnClickPendingIntent(
-                R.id.widgetRefresh,
-                if (state.connected) broadcastIntent(context, ACTION_REFRESH, 21) else openApp,
-            )
-            views.setOnClickPendingIntent(
+            views.setTextViewText(R.id.widgetStatus, state.status)
+            views.setOnClickPendingIntent(R.id.widgetRoot, openApp(context))
+
+            val actionsVisible = state.hasMug
+            views.setViewVisibility(R.id.widgetActions, if (actionsVisible) View.VISIBLE else View.GONE)
+            views.setTextViewText(
                 R.id.widgetPreset,
-                if (state.connected) broadcastIntent(context, ACTION_PRESET, 22) else openApp,
+                state.presetLabel?.let { context.getString(R.string.widget_heat_to, it) } ?: context.getString(R.string.widget_preset),
             )
-            views.setOnClickPendingIntent(
-                R.id.widgetHeaterOff,
-                if (state.connected) broadcastIntent(context, ACTION_HEATER_OFF, 23) else openApp,
-            )
+            views.setOnClickPendingIntent(R.id.widgetPreset, QuickActionReceiver.pendingIntent(context, QuickAction.PRESET))
+            views.setOnClickPendingIntent(R.id.widgetHeaterOff, QuickActionReceiver.pendingIntent(context, QuickAction.HEATER_OFF))
             return views
         }
 
-        private fun activityIntent(context: Context): PendingIntent = PendingIntent.getActivity(
+        private fun openApp(context: Context): PendingIntent = PendingIntent.getActivity(
             context,
             20,
             Intent(context, MainActivity::class.java),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
-
-        private fun broadcastIntent(context: Context, action: String, requestCode: Int): PendingIntent =
-            PendingIntent.getBroadcast(
-                context,
-                requestCode,
-                Intent(context, EmberWidgetProvider::class.java).setAction(action),
-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-            )
-
-        private fun formatTemperature(celsius: Float, unit: DisplayUnit): String {
-            val value = EmberRepository.displayTemperature(celsius, unit)
-            return if (unit == DisplayUnit.FAHRENHEIT) {
-                String.format(Locale.US, "%.0f°", value)
-            } else {
-                String.format(Locale.US, "%.1f°", value)
-            }
-        }
     }
 }

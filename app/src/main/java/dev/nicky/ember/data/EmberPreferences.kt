@@ -2,6 +2,7 @@ package dev.nicky.ember.data
 
 import android.content.Context
 import androidx.core.content.edit
+import dev.nicky.ember.ble.EmberProtocol
 import dev.nicky.ember.ble.MugSnapshot
 
 class EmberPreferences(context: Context) {
@@ -18,7 +19,7 @@ class EmberPreferences(context: Context) {
     }.sortedByDescending(MugProfile::lastSeenAt)
 
     fun rememberCandidate(address: String, name: String, rssi: Int?) {
-        val addresses = knownAddresses().toMutableSet().apply { add(address) }
+        val addresses = knownAddresses() + address
         preferences.edit {
             putStringSet(KEY_KNOWN_ADDRESSES, addresses)
             putString(key(address, "name"), name)
@@ -27,12 +28,20 @@ class EmberPreferences(context: Context) {
         }
     }
 
+    fun forget(address: String) {
+        val prefix = key(address, "")
+        preferences.edit {
+            putStringSet(KEY_KNOWN_ADDRESSES, knownAddresses() - address)
+            preferences.all.keys.filter { it.startsWith(prefix) }.forEach(::remove)
+        }
+    }
+
     fun setNickname(address: String, nickname: String) {
         preferences.edit { putString(key(address, "nickname"), nickname.trim()) }
     }
 
     fun displayUnit(): DisplayUnit = runCatching {
-        DisplayUnit.valueOf(preferences.getString(KEY_DISPLAY_UNIT, DisplayUnit.CELSIUS.name)!!)
+        DisplayUnit.valueOf(preferences.getString(KEY_DISPLAY_UNIT, null) ?: DisplayUnit.CELSIUS.name)
     }.getOrDefault(DisplayUnit.CELSIUS)
 
     fun setDisplayUnit(unit: DisplayUnit) {
@@ -43,7 +52,7 @@ class EmberPreferences(context: Context) {
         val values = preferences.getString(KEY_PRESETS, null)
             ?.split(',')
             ?.mapNotNull(String::toFloatOrNull)
-            ?.filter { it in 49f..63f }
+            ?.filter { it in EmberProtocol.MIN_TARGET_CELSIUS..EmberProtocol.MAX_TARGET_CELSIUS }
             .orEmpty()
         return values.takeIf { it.size == PRESET_COUNT } ?: DEFAULT_PRESETS
     }
@@ -61,28 +70,24 @@ class EmberPreferences(context: Context) {
 
     fun persistSnapshot(address: String, snapshot: MugSnapshot) {
         preferences.edit {
-            snapshot.name?.let { putString(key(address, "name"), it) }
-            snapshot.currentTemperatureC?.let { putFloat(key(address, "current"), it) }
-            snapshot.targetTemperatureC?.let { putFloat(key(address, "target"), it) }
-            snapshot.batteryPercent?.let { putInt(key(address, "battery"), it) }
-            snapshot.charging?.let { putBoolean(key(address, "charging"), it) }
-            snapshot.liquidLevel?.let { putInt(key(address, "level"), it) }
-            snapshot.liquidState?.let { putInt(key(address, "state"), it) }
-            snapshot.firmwareVersion?.let { putInt(key(address, "firmware"), it) }
-            snapshot.hardwareVersion?.let { putInt(key(address, "hardware"), it) }
-            snapshot.bootloaderVersion?.let { putInt(key(address, "bootloader"), it) }
-            snapshot.setupKeyPresent?.let { putBoolean(key(address, "setup_key"), it) }
-            snapshot.ledRgba?.takeIf { it.size >= 3 }?.let { colour ->
-                putInt(key(address, "led_red"), colour[0])
-                putInt(key(address, "led_green"), colour[1])
-                putInt(key(address, "led_blue"), colour[2])
-            }
+            putNullable(key(address, "name"), snapshot.name)
+            putNullable(key(address, "current"), snapshot.currentTemperatureC)
+            putNullable(key(address, "target"), snapshot.targetTemperatureC)
+            putNullable(key(address, "battery"), snapshot.batteryPercent)
+            putNullable(key(address, "charging"), snapshot.charging)
+            putNullable(key(address, "level"), snapshot.liquidLevel)
+            putNullable(key(address, "state"), snapshot.liquidState)
+            putNullable(key(address, "firmware"), snapshot.firmwareVersion)
+            putNullable(key(address, "hardware"), snapshot.hardwareVersion)
+            putNullable(key(address, "bootloader"), snapshot.bootloaderVersion)
+            putNullable(key(address, "setup_key"), snapshot.setupKeyPresent)
+            putNullable(key(address, "led_rgb"), snapshot.ledColor)
             putLong(key(address, "snapshot_time"), System.currentTimeMillis())
         }
     }
 
     fun cachedSnapshot(address: String?): Pair<MugSnapshot, Long> {
-        if (address == null || !knownAddresses().contains(address)) return MugSnapshot() to 0L
+        if (address == null || address !in knownAddresses()) return MugSnapshot() to 0L
         val snapshot = MugSnapshot(
             name = preferences.getString(key(address, "name"), null),
             currentTemperatureC = floatOrNull(key(address, "current")),
@@ -95,7 +100,7 @@ class EmberPreferences(context: Context) {
             hardwareVersion = intOrNull(key(address, "hardware")),
             bootloaderVersion = intOrNull(key(address, "bootloader")),
             setupKeyPresent = booleanOrNull(key(address, "setup_key")),
-            ledRgba = cachedLedColour(address),
+            ledColor = intOrNull(key(address, "led_rgb")) ?: legacyLedColor(address),
         )
         return snapshot to preferences.getLong(key(address, "snapshot_time"), 0L)
     }
@@ -108,22 +113,33 @@ class EmberPreferences(context: Context) {
 
     private fun booleanOrNull(key: String): Boolean? = if (preferences.contains(key)) preferences.getBoolean(key, false) else null
 
-    private fun cachedLedColour(address: String): IntArray? {
+    /** Version 0.2 stored the LED colour as three separate channel keys. */
+    private fun legacyLedColor(address: String): Int? {
         val red = intOrNull(key(address, "led_red")) ?: return null
         val green = intOrNull(key(address, "led_green")) ?: return null
         val blue = intOrNull(key(address, "led_blue")) ?: return null
-        return intArrayOf(red, green, blue, 255)
+        return (red shl 16) or (green shl 8) or blue
+    }
+
+    private fun android.content.SharedPreferences.Editor.putNullable(key: String, value: Any?) {
+        when (value) {
+            null -> {}
+            is String -> putString(key, value)
+            is Float -> putFloat(key, value)
+            is Int -> putInt(key, value)
+            is Boolean -> putBoolean(key, value)
+        }
     }
 
     private fun key(address: String, suffix: String): String = "mug_${address.replace(':', '_')}_$suffix"
 
-    private companion object {
-        const val FILE_NAME = "ember_preferences"
-        const val KEY_KNOWN_ADDRESSES = "known_addresses"
-        const val KEY_DISPLAY_UNIT = "display_unit"
-        const val KEY_PRESETS = "temperature_presets"
-        const val KEY_BACKGROUND_MONITORING = "background_monitoring"
-        const val NO_RSSI = Int.MIN_VALUE
+    companion object {
+        private const val FILE_NAME = "ember_preferences"
+        private const val KEY_KNOWN_ADDRESSES = "known_addresses"
+        private const val KEY_DISPLAY_UNIT = "display_unit"
+        private const val KEY_PRESETS = "temperature_presets"
+        private const val KEY_BACKGROUND_MONITORING = "background_monitoring"
+        private const val NO_RSSI = Int.MIN_VALUE
         const val PRESET_COUNT = 3
         val DEFAULT_PRESETS = listOf(54.5f, 57.5f, 60f)
     }

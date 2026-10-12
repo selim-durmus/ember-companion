@@ -4,80 +4,105 @@
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:background="@drawable/widget_background"
+    android:clipToOutline="true"
     android:orientation="vertical"
     android:padding="16dp">
 
-    <TextView
-        android:id="@+id/widgetMugName"
+    <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:maxLines="1"
-        android:text="@string/default_mug_name"
-        android:textColor="@color/ember_ink"
-        android:textSize="16sp"
-        android:textStyle="bold" />
+        android:gravity="center_vertical"
+        android:orientation="horizontal">
 
-    <TextView
-        android:id="@+id/widgetCurrentTemperature"
+        <ImageView
+            android:layout_width="18dp"
+            android:layout_height="18dp"
+            android:contentDescription="@null"
+            android:src="@drawable/ic_mug_notification"
+            android:tint="@color/ember_widget_accent" />
+
+        <TextView
+            android:id="@+id/widgetMugName"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="6dp"
+            android:layout_weight="1"
+            android:ellipsize="end"
+            android:maxLines="1"
+            android:text="@string/app_name"
+            android:textColor="@color/ember_widget_ink"
+            android:textSize="14sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/widgetStatus"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="8dp"
+            android:maxLines="1"
+            android:text="@string/widget_not_connected"
+            android:textColor="@color/ember_widget_muted"
+            android:textSize="12sp" />
+    </LinearLayout>
+
+    <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="0dp"
         android:layout_weight="1"
         android:gravity="center_vertical"
-        android:text="@string/not_available"
-        android:textColor="@color/ember_ink"
-        android:textSize="36sp"
-        android:textStyle="bold" />
-
-    <TextView
-        android:id="@+id/widgetTarget"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:text="@string/widget_target_placeholder"
-        android:textColor="@color/ember_copper_dark"
-        android:textSize="13sp" />
-
-    <TextView
-        android:id="@+id/widgetStatus"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="2dp"
-        android:maxLines="1"
-        android:text="@string/not_connected"
-        android:textColor="@color/ember_sage"
-        android:textSize="11sp" />
-
-    <LinearLayout
-        style="?android:attr/buttonBarStyle"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="8dp"
         android:orientation="horizontal">
 
-        <Button
-            android:id="@+id/widgetRefresh"
-            style="?android:attr/buttonBarButtonStyle"
-            android:layout_width="0dp"
-            android:layout_height="40dp"
-            android:layout_weight="1"
-            android:text="@string/refresh"
-            android:textSize="11sp" />
+        <TextView
+            android:id="@+id/widgetCurrentTemperature"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/not_available"
+            android:textColor="@color/ember_widget_ink"
+            android:textSize="40sp" />
 
-        <Button
+        <TextView
+            android:id="@+id/widgetTarget"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="10dp"
+            android:maxLines="1"
+            android:text="@string/widget_target_unknown"
+            android:textColor="@color/ember_widget_accent"
+            android:textSize="13sp" />
+    </LinearLayout>
+
+    <LinearLayout
+        android:id="@+id/widgetActions"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal">
+
+        <TextView
             android:id="@+id/widgetPreset"
-            style="?android:attr/buttonBarButtonStyle"
             android:layout_width="0dp"
             android:layout_height="40dp"
+            android:layout_marginEnd="6dp"
             android:layout_weight="1"
+            android:background="@drawable/widget_button_background"
+            android:gravity="center"
+            android:maxLines="1"
             android:text="@string/widget_preset"
-            android:textSize="11sp" />
+            android:textColor="@color/ember_widget_ink"
+            android:textSize="13sp"
+            android:textStyle="bold" />
 
-        <Button
+        <TextView
             android:id="@+id/widgetHeaterOff"
-            style="?android:attr/buttonBarButtonStyle"
             android:layout_width="0dp"
             android:layout_height="40dp"
+            android:layout_marginStart="6dp"
             android:layout_weight="1"
+            android:background="@drawable/widget_button_background"
+            android:gravity="center"
+            android:maxLines="1"
             android:text="@string/widget_off"
-            android:textSize="11sp" />
+            android:textColor="@color/ember_widget_ink"
+            android:textSize="13sp"
+            android:textStyle="bold" />
     </LinearLayout>
 </LinearLayout>

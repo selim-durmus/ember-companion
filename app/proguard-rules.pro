@@ -1,2 +1,1 @@
-# Keep empty until release shrinking is enabled.
-
+# The app uses no reflection or serialization, so the default optimize rules are sufficient.

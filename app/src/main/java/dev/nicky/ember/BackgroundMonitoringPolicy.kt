@@ -1,22 +1,18 @@
 package dev.nicky.ember
 
+import dev.nicky.ember.ble.LiquidState
 import dev.nicky.ember.data.EmberAppState
 
 internal object BackgroundMonitoringPolicy {
-    fun isKnownEmpty(state: EmberAppState): Boolean = state.snapshot.liquidState == LIQUID_STATE_EMPTY
+    fun isKnownEmpty(state: EmberAppState): Boolean = state.snapshot.liquidState == LiquidState.EMPTY
 
-    fun isLiveEmpty(state: EmberAppState): Boolean {
-        return state.connected && state.snapshotFresh && isKnownEmpty(state)
-    }
+    fun isLiveEmpty(state: EmberAppState): Boolean = state.connected && state.snapshotFresh && isKnownEmpty(state)
 
-    fun shouldRunService(state: EmberAppState): Boolean {
-        return state.backgroundMonitoring && !isKnownEmpty(state)
-    }
-
-    fun isRefill(previousLiquidState: Int?, currentLiquidState: Int?): Boolean {
-        return previousLiquidState == LIQUID_STATE_EMPTY &&
-            currentLiquidState != null && currentLiquidState != LIQUID_STATE_EMPTY
-    }
-
-    private const val LIQUID_STATE_EMPTY = 1
+    /**
+     * Monitoring keeps a foreground service and connection alive only while it can be useful:
+     * the feature is on, a mug is chosen, Bluetooth access is granted and the mug is not empty.
+     * An empty mug pauses monitoring until the app sees it refilled.
+     */
+    fun shouldRunService(state: EmberAppState): Boolean =
+        state.backgroundMonitoring && state.hasPermissions && state.selectedAddress != null && !isKnownEmpty(state)
 }

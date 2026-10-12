@@ -1,42 +1,49 @@
 # Ember Companion
 
-A small, local-first Android controller for an Ember Ceramic Mug. It talks directly to the mug over BLE; it does not require an Ember account or cloud service.
+A small, local-first Android controller for Ember mugs. It talks directly to the mug over Bluetooth LE; no Ember account or cloud service is involved.
 
-Current MVP scope:
+## Features
 
-- reconnect to a previously bonded mug without tying BLE lifetime to the screen
-- choose between bonded, saved, and nearby Ember mugs without dropping the active connection
-- assign local nicknames so identical mugs are easy to distinguish
-- show current/target temperature, battery, charger, liquid level, and liquid state
-- set the target temperature from 49–63 °C
-- switch between Celsius and Fahrenheit and save three presets
-- turn the heater off
-- customize the hardware mug name and identification LED colour
-- inspect live and cached mug details, including firmware, hardware, bootloader, and control access
-- optionally keep monitoring in the background and notify when a drink is ready
-- use a home-screen widget and Quick Settings tile for common actions
-- subscribe to mug push events and refresh changed values
-- retry transient Android GATT disconnects with stale-callback and operation-timeout protection
+- Live drink temperature on a dial, with liquid state, battery/charging and fill level
+- Target temperature (49–63 °C / 121–145 °F) via −/+ stepper, slider or three presets. Changes apply automatically and are read back from the mug to confirm them
+- Heater on/off switch
+- Long-press a preset to save the current target to it
+- Celsius or Fahrenheit, synced to the mug
+- Several mugs: pick, pair and switch between them; local nicknames tell identical mugs apart
+- Rename the mug and change its LED colour
+- Mug details (firmware, hardware, bootloader, control access) and an activity log
+- **Ready alerts**: an optional foreground service keeps the mug connected and notifies once when the drink reaches its target. It pauses while the mug is empty
+- Home-screen widget and Quick Settings tile that can heat or turn off the mug without opening the app
+- Recovers on its own from dropped connections, a sleeping mug and Bluetooth being toggled
 
-Protocol details and the physical-device findings are in [docs/protocol.md](docs/protocol.md).
+Protocol notes and the physical-device findings are in [docs/protocol.md](docs/protocol.md).
 
 ## Build
 
-Install JDK 17 and the Android SDK, then point the standard environment variables at your local installations:
+Requirements: JDK 17+ and the Android SDK with platform 37.
 
 ```sh
-export JAVA_HOME=/path/to/jdk-17
-export ANDROID_HOME=/path/to/android-sdk
-./gradlew assembleDebug
+./gradlew testDebugUnitTest assembleDebug
 ```
 
 Install the debug APK:
 
 ```sh
-$ANDROID_HOME/platform-tools/adb install -r app/build/outputs/apk/debug/app-debug.apk
+adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
-The app targets Android 16/API 36 and has a minimum of Android 12/API 31.
+The app targets Android 17 (API 37) and supports Android 12 (API 31) and newer.
+
+## Architecture
+
+| Layer | Files |
+|---|---|
+| BLE protocol and GATT session | `ble/EmberProtocol.kt`, `ble/EmberBleClient.kt`, `ble/ReconnectPolicy.kt` |
+| State and persistence | `data/EmberRepository.kt`, `data/EmberAppState.kt`, `data/EmberPreferences.kt` |
+| UI (Jetpack Compose, Material 3) | `MainActivity.kt`, `MainViewModel.kt`, `ui/` |
+| Background and system surfaces | `EmberConnectionService.kt`, `QuickActionReceiver.kt`, `EmberWidgetProvider.kt`, `EmberTileService.kt` |
+
+`EmberRepository` is the single source of truth. It decides when the monitoring service runs and how hard the BLE client should try to stay connected. The activity, service, widget and tile all observe its `StateFlow`.
 
 ## Project status
 

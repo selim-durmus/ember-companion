@@ -1,6 +1,7 @@
 package dev.nicky.ember
 
 import dev.nicky.ember.ble.ConnectionState
+import dev.nicky.ember.ble.LiquidState
 import dev.nicky.ember.ble.MugSnapshot
 import dev.nicky.ember.data.EmberAppState
 import org.junit.Assert.assertFalse
@@ -10,7 +11,7 @@ import org.junit.Test
 class BackgroundMonitoringPolicyTest {
     @Test
     fun `fresh connected empty mug pauses monitoring`() {
-        val state = monitoringState(liquidState = 1, connected = true, fresh = true)
+        val state = monitoringState(liquidState = LiquidState.EMPTY, connected = true, fresh = true)
 
         assertTrue(BackgroundMonitoringPolicy.isKnownEmpty(state))
         assertTrue(BackgroundMonitoringPolicy.isLiveEmpty(state))
@@ -18,8 +19,8 @@ class BackgroundMonitoringPolicyTest {
     }
 
     @Test
-    fun `stale empty state is not treated as a live auto-pause signal`() {
-        val state = monitoringState(liquidState = 1, connected = false, fresh = false)
+    fun `stale empty state is not a live pause signal but keeps the service off`() {
+        val state = monitoringState(liquidState = LiquidState.EMPTY, connected = false, fresh = false)
 
         assertFalse(BackgroundMonitoringPolicy.isLiveEmpty(state))
         assertFalse(BackgroundMonitoringPolicy.shouldRunService(state))
@@ -27,27 +28,32 @@ class BackgroundMonitoringPolicyTest {
 
     @Test
     fun `non-empty mug keeps monitoring service active`() {
-        val state = monitoringState(liquidState = 5, connected = true, fresh = true)
+        val state = monitoringState(liquidState = LiquidState.HEATING, connected = true, fresh = true)
 
         assertFalse(BackgroundMonitoringPolicy.isLiveEmpty(state))
         assertTrue(BackgroundMonitoringPolicy.shouldRunService(state))
     }
 
     @Test
-    fun `only a known empty to non-empty transition counts as refill`() {
-        assertTrue(BackgroundMonitoringPolicy.isRefill(1, 2))
-        assertTrue(BackgroundMonitoringPolicy.isRefill(1, 5))
-        assertFalse(BackgroundMonitoringPolicy.isRefill(1, null))
-        assertFalse(BackgroundMonitoringPolicy.isRefill(null, 2))
-        assertFalse(BackgroundMonitoringPolicy.isRefill(5, 6))
+    fun `service needs the feature, permissions and a chosen mug`() {
+        val base = monitoringState(liquidState = LiquidState.HEATING, connected = true, fresh = true)
+
+        assertFalse(BackgroundMonitoringPolicy.shouldRunService(base.copy(backgroundMonitoring = false)))
+        assertFalse(BackgroundMonitoringPolicy.shouldRunService(base.copy(hasPermissions = false)))
+        assertFalse(BackgroundMonitoringPolicy.shouldRunService(base.copy(selectedAddress = null)))
     }
 
-    private fun monitoringState(liquidState: Int, connected: Boolean, fresh: Boolean): EmberAppState {
-        return EmberAppState(
-            connectionState = if (connected) ConnectionState.CONNECTED else ConnectionState.DISCONNECTED,
-            snapshot = MugSnapshot(liquidState = liquidState),
-            snapshotFresh = fresh,
-            backgroundMonitoring = true,
-        )
+    @Test
+    fun `unknown liquid state does not block monitoring`() {
+        assertTrue(BackgroundMonitoringPolicy.shouldRunService(monitoringState(liquidState = null, connected = false, fresh = false)))
     }
+
+    private fun monitoringState(liquidState: Int?, connected: Boolean, fresh: Boolean) = EmberAppState(
+        connectionState = if (connected) ConnectionState.CONNECTED else ConnectionState.DISCONNECTED,
+        hasPermissions = true,
+        selectedAddress = "AA:BB:CC:DD:EE:FF",
+        snapshot = MugSnapshot(liquidState = liquidState),
+        snapshotFresh = fresh,
+        backgroundMonitoring = true,
+    )
 }

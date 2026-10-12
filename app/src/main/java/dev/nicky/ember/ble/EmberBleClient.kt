@@ -7,6 +7,7 @@ import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothGatt
 import android.bluetooth.BluetoothGattCallback
 import android.bluetooth.BluetoothGattCharacteristic
+import android.bluetooth.BluetoothGattConnectionSettings
 import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothGattService
 import android.bluetooth.BluetoothManager
@@ -25,6 +26,7 @@ import android.os.Handler
 import android.os.Looper
 import android.os.ParcelUuid
 import androidx.core.content.ContextCompat
+import androidx.core.content.IntentCompat
 import androidx.core.content.edit
 import java.util.ArrayDeque
 import java.util.Locale
@@ -42,13 +44,22 @@ data class BleWriteStatus(
     val message: String,
 )
 
+/**
+ * Owns the single GATT session with the selected mug. Every public method and every listener
+ * callback runs on the main thread; GATT and scan callbacks are re-posted there.
+ */
 class EmberBleClient(
     private val context: Context,
     private val listener: Listener,
 ) {
     interface Listener {
         fun onConnectionStateChanged(state: ConnectionState, detail: String, selectedAddress: String?)
-        fun onSnapshotChanged(address: String, snapshot: MugSnapshot)
+
+        /**
+         * @param synced true once every readable characteristic has been read in the current
+         *   session. Before that, the snapshot only holds the values read so far.
+         */
+        fun onSnapshotChanged(address: String, snapshot: MugSnapshot, synced: Boolean)
         fun onMugCandidates(candidates: List<MugCandidate>)
         fun onScanStateChanged(scanning: Boolean, detail: String)
         fun onWriteStatus(status: BleWriteStatus)
@@ -58,11 +69,11 @@ class EmberBleClient(
     private sealed interface GattOperation {
         val characteristicUuid: UUID
 
-        data class Read(val characteristic: BluetoothGattCharacteristic) : GattOperation {
+        class Read(val characteristic: BluetoothGattCharacteristic) : GattOperation {
             override val characteristicUuid: UUID = characteristic.uuid
         }
 
-        data class Write(
+        class Write(
             val characteristic: BluetoothGattCharacteristic,
             val value: ByteArray,
             val description: String,
@@ -70,7 +81,7 @@ class EmberBleClient(
             override val characteristicUuid: UUID = characteristic.uuid
         }
 
-        data class WriteDescriptor(
+        class WriteDescriptor(
             val descriptor: BluetoothGattDescriptor,
             val value: ByteArray,
         ) : GattOperation {
@@ -86,76 +97,95 @@ class EmberBleClient(
     private val operationQueue = ArrayDeque<GattOperation>()
     private val scanResults = linkedMapOf<String, MugCandidate>()
     private val pendingVerifications = mutableMapOf<UUID, GattOperation.Write>()
+    private val pendingInitialReads = mutableSetOf<UUID>()
 
     private var gatt: BluetoothGatt? = null
     private var service: BluetoothGattService? = null
     private var operationInFlight: GattOperation? = null
     private var operationTimeout: Runnable? = null
+    private var disconnectWatchdog: Runnable? = null
     private var snapshot = MugSnapshot()
+    private var synced = false
     private var state = ConnectionState.DISCONNECTED
     private var scanCallback: ScanCallback? = null
     private var scanTimeout: Runnable? = null
     private var scanGeneration = 0L
+    private var scanKnownAddresses: Set<String> = emptySet()
     private var selectedDevice: BluetoothDevice? = null
-    private var receiverRegistered = false
-    private var manualDisconnect = false
-    private var retryCount = 0
+
+    /** True while the user (or the monitoring service) wants a live session with [selectedDevice]. */
+    private var wantConnection = false
+    private var persistentReconnect = false
+    private var backgroundConnect = false
+    private var failures = 0
     private var retryRunnable: Runnable? = null
     private var pairingTimeout: Runnable? = null
-    private var sessionGeneration = 0L
     private var closed = false
 
-    init {
-        registerBondReceiver()
+    fun hasPermissions(): Boolean = REQUIRED_PERMISSIONS.all {
+        ContextCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED
     }
 
-    fun hasPermissions(): Boolean =
-        ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED &&
-            ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED
+    fun isBluetoothEnabled(): Boolean = adapter?.isEnabled == true
 
     fun preferredAddress(): String? = preferences.getString(PREF_ADDRESS, null)
 
-    fun currentAddress(): String? = selectedDevice?.address
+    /**
+     * Keeps retrying in the background (via Android's auto-connect) after quick retries fail.
+     * Enabled while the monitoring service runs or the app is on screen.
+     */
+    fun setPersistentReconnect(enabled: Boolean) {
+        if (persistentReconnect == enabled) return
+        persistentReconnect = enabled
+        if (enabled && wantConnection && state == ConnectionState.DISCONNECTED && gatt == null) {
+            selectedDevice?.takeIf { it.isBondedSafe() }?.let { connect(it) }
+        } else if (!enabled && backgroundConnect) {
+            log("Stopped waiting for the mug in the background")
+            wantConnection = false
+            teardown()
+            changeState(ConnectionState.DISCONNECTED, "Not connected")
+        }
+    }
 
     @SuppressLint("MissingPermission")
     fun knownMugs(): List<MugCandidate> {
         if (!hasPermissions()) return emptyList()
-        val rememberedAddresses = preferences.getStringSet(PREF_KNOWN_ADDRESSES, emptySet()).orEmpty()
+        val remembered = rememberedAddresses()
+        val preferred = preferredAddress()
         return adapter?.bondedDevices.orEmpty()
-            .filter { it.isEmber() || it.address == preferredAddress() || it.address in rememberedAddresses }
+            .filter { it.isEmber() || it.address == preferred || it.address in remembered }
             .map { it.toCandidate(scanResults[it.address]?.rssi) }
-            .sortedWith(compareByDescending<MugCandidate> { it.address == preferredAddress() }.thenBy { it.name })
+            .sortedWith(compareByDescending<MugCandidate> { it.address == preferred }.thenBy { it.name })
     }
 
+    /** Connects to the remembered mug, the only paired mug, or reports that a choice is needed. */
     @SuppressLint("MissingPermission")
-    fun connectPreferred() {
+    fun connectPreferred(): ConnectResult {
+        if (closed) return ConnectResult.UNAVAILABLE
         if (!hasPermissions()) {
             log("Bluetooth permission is missing")
-            return
+            return ConnectResult.NO_PERMISSION
         }
-        if (adapter?.isEnabled != true) {
-            changeState(ConnectionState.DISCONNECTED, "Bluetooth is turned off")
-            return
+        if (!isBluetoothEnabled()) {
+            changeState(ConnectionState.DISCONNECTED, "Bluetooth is off")
+            return ConnectResult.BLUETOOTH_OFF
         }
-        if (state != ConnectionState.DISCONNECTED && selectedDevice != null) {
-            log("Connection already active for ${selectedDevice?.safeLabel()}")
-            return
-        }
-        val rememberedAddresses = preferences.getStringSet(PREF_KNOWN_ADDRESSES, emptySet()).orEmpty()
-        val bonded = adapter?.bondedDevices.orEmpty().filter {
-            it.isEmber() || it.address == preferredAddress() || it.address in rememberedAddresses
-        }
-        val savedAddress = preferredAddress()
-        val preferred = bonded.firstOrNull { it.address == savedAddress } ?: bonded.singleOrNull()
-        when {
-            preferred != null -> connect(preferred)
+        if (state != ConnectionState.DISCONNECTED && selectedDevice != null) return ConnectResult.STARTED
+        val bonded = knownMugs()
+        val preferred = bonded.firstOrNull { it.address == preferredAddress() } ?: bonded.singleOrNull()
+        return when {
+            preferred != null -> {
+                adapter?.getRemoteDevice(preferred.address)?.let { connect(it) }
+                ConnectResult.STARTED
+            }
             bonded.size > 1 -> {
                 emitCandidates()
-                changeState(ConnectionState.DISCONNECTED, "Choose a paired mug")
+                changeState(ConnectionState.DISCONNECTED, "Choose which mug to connect")
+                ConnectResult.NEEDS_CHOICE
             }
             else -> {
-                changeState(ConnectionState.DISCONNECTED, "No paired mug selected")
-                scanForMugs()
+                changeState(ConnectionState.DISCONNECTED, "No paired mug yet")
+                ConnectResult.NEEDS_CHOICE
             }
         }
     }
@@ -164,15 +194,16 @@ class EmberBleClient(
     fun scanForMugs() {
         if (!hasPermissions()) return
         stopScan(notify = false)
-        val scanner = adapter?.bluetoothLeScanner
+        val scanner = adapter?.takeIf { it.isEnabled }?.bluetoothLeScanner
         if (scanner == null) {
-            listener.onScanStateChanged(false, "Bluetooth scanner unavailable")
+            listener.onScanStateChanged(false, if (isBluetoothEnabled()) "Bluetooth scanner unavailable" else "Bluetooth is off")
             return
         }
         scanResults.clear()
+        scanKnownAddresses = knownMugs().mapTo(mutableSetOf()) { it.address } + listOfNotNull(preferredAddress())
         val generation = ++scanGeneration
         emitCandidates()
-        listener.onScanStateChanged(true, "Looking for additional Ember mugs…")
+        listener.onScanStateChanged(true, "Looking for nearby Ember mugs…")
         val callback = object : ScanCallback() {
             override fun onScanResult(callbackType: Int, result: ScanResult) {
                 handler.post { if (generation == scanGeneration) acceptScanResult(result) }
@@ -192,6 +223,7 @@ class EmberBleClient(
             }
         }
         scanCallback = callback
+        // Mugs do not reliably advertise the Ember service UUID, so filter in acceptScanResult.
         scanner.startScan(
             null,
             ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build(),
@@ -204,67 +236,63 @@ class EmberBleClient(
             emitCandidates()
             listener.onScanStateChanged(
                 false,
-                if (nearbyCount == 0) "No new mugs advertising; paired mugs are still available"
-                else "$nearbyCount nearby Ember mug${if (nearbyCount == 1) "" else "s"} found",
+                when (nearbyCount) {
+                    0 -> "No mugs advertising nearby"
+                    1 -> "1 mug nearby"
+                    else -> "$nearbyCount mugs nearby"
+                },
             )
         }.also { handler.postDelayed(it, SCAN_DURATION_MS) }
     }
 
-    fun stopMugScan() {
-        stopScan(notify = true)
-    }
+    fun stopMugScan() = stopScan(notify = true)
 
     @SuppressLint("MissingPermission")
     fun selectMug(address: String) {
-        if (!hasPermissions()) return
+        if (closed || !hasPermissions()) return
         if (state == ConnectionState.CONNECTED && selectedDevice?.address == address) {
             stopScan(notify = false)
-            log("Already connected to ${selectedDevice?.safeLabel()}")
             return
         }
-        val device = adapter?.getRemoteDevice(address) ?: return
+        val device = runCatching { adapter?.getRemoteDevice(address) }.getOrNull() ?: return
         stopScan(notify = false)
-        selectedDevice = device
         rememberAddress(address)
         if (device.bondState == BluetoothDevice.BOND_BONDED) {
             connect(device)
+            return
+        }
+        teardown()
+        selectedDevice = device
+        wantConnection = true
+        failures = 0
+        changeState(ConnectionState.PAIRING, "Pairing… keep the mug pulsing blue and approve the Android prompt")
+        schedulePairingTimeout(device)
+        if (device.bondState == BluetoothDevice.BOND_BONDING) {
+            log("Waiting for the in-progress bond with ${device.safeLabel()}")
         } else {
-            beginIntentionalTransition()
-            closeCurrentGatt()
-            selectedDevice = device
-            // beginIntentionalTransition marks callbacks from the previous GATT session as
-            // manual. Pairing is a new active session, so its bond broadcasts must not be
-            // discarded as manual-disconnect callbacks.
-            manualDisconnect = false
-            changeState(ConnectionState.PAIRING, "Pairing… keep the mug pulsing blue and approve any Android prompt")
-            schedulePairingTimeout(device)
-            if (device.bondState == BluetoothDevice.BOND_BONDING) {
-                log("Waiting for the in-progress LE bond with ${device.safeLabel()}")
+            log("Starting LE bond with ${device.safeLabel()}")
+            val started = if (Build.VERSION.SDK_INT >= 37) {
+                device.createBond(BluetoothDevice.TRANSPORT_LE)
             } else {
-                log("Starting LE bond with ${device.safeLabel()}")
-                if (!device.createBond()) {
-                    cancelPairingTimeout()
-                    changeState(ConnectionState.DISCONNECTED, "Could not start pairing")
-                }
+                device.createBond()
+            }
+            if (!started) {
+                cancelPairingTimeout()
+                wantConnection = false
+                changeState(ConnectionState.DISCONNECTED, "Could not start pairing")
             }
         }
     }
 
     fun disconnect() {
-        beginIntentionalTransition()
+        wantConnection = false
         stopScan(notify = false)
-        closeCurrentGatt()
-        retryCount = 0
+        teardown()
         changeState(ConnectionState.DISCONNECTED, "Disconnected")
     }
 
-    fun cancelConnection() = disconnect()
-
     fun refresh() {
-        if (state != ConnectionState.CONNECTED) {
-            log("Refresh ignored: mug is not connected")
-            return
-        }
+        if (state != ConnectionState.CONNECTED) return
         enqueueReads()
     }
 
@@ -276,7 +304,7 @@ class EmberBleClient(
         writeCharacteristic(
             EmberProtocol.TARGET_TEMPERATURE,
             value,
-            if (celsius == 0f) "Heater off" else "Target set to %.1f °C".format(Locale.US, celsius),
+            if (celsius == EmberProtocol.HEATER_OFF_CELSIUS) "Heater off" else "Target %.1f °C".format(Locale.US, celsius),
         )
     }
 
@@ -284,7 +312,8 @@ class EmberBleClient(
         writeCharacteristic(
             EmberProtocol.TEMPERATURE_UNIT,
             EmberProtocol.encodeTemperatureUnit(fahrenheit),
-            if (fahrenheit) "Mug unit set to Fahrenheit" else "Mug unit set to Celsius",
+            if (fahrenheit) "Mug unit set to °F" else "Mug unit set to °C",
+            reportStatus = false,
         )
     }
 
@@ -293,7 +322,7 @@ class EmberBleClient(
             failWrite(EmberProtocol.NAME, it.message ?: "Invalid mug name")
             return
         }
-        writeCharacteristic(EmberProtocol.NAME, value, "Mug name changed to $name")
+        writeCharacteristic(EmberProtocol.NAME, value, "Mug renamed to $name")
     }
 
     fun setLedColor(red: Int, green: Int, blue: Int) {
@@ -306,42 +335,61 @@ class EmberBleClient(
 
     fun close() {
         if (closed) return
-        closed = true
         disconnect()
+        closed = true
         handler.removeCallbacksAndMessages(null)
-        if (receiverRegistered) {
-            context.unregisterReceiver(bondReceiver)
-            receiverRegistered = false
+        runCatching { context.unregisterReceiver(systemReceiver) }
+    }
+
+    // region Connection lifecycle
+
+    @SuppressLint("MissingPermission")
+    private fun connect(device: BluetoothDevice, isRetry: Boolean = false, background: Boolean = false) {
+        if (closed || !hasPermissions()) return
+        if (!isBluetoothEnabled()) {
+            selectedDevice = device
+            wantConnection = true
+            changeState(ConnectionState.DISCONNECTED, "Bluetooth is off")
+            return
+        }
+        stopScan(notify = false)
+        teardown()
+        selectedDevice = device
+        wantConnection = true
+        backgroundConnect = background
+        rememberAddress(device.address)
+        if (!isRetry) failures = 0
+        snapshot = MugSnapshot()
+        synced = false
+        changeState(
+            ConnectionState.CONNECTING,
+            when {
+                background -> "Waiting for ${device.safeLabel()} to wake up…"
+                isRetry -> "Reconnecting…"
+                else -> "Connecting to ${device.safeLabel()}…"
+            },
+        )
+        if (!isRetry) log("Connecting to ${device.safeLabel()} (…${device.address.takeLast(5)})")
+        gatt = openGatt(device, autoConnect = background)
+        if (gatt == null) {
+            wantConnection = false
+            changeState(ConnectionState.DISCONNECTED, "Could not open a Bluetooth connection")
         }
     }
 
     @SuppressLint("MissingPermission")
-    private fun connect(device: BluetoothDevice, resetRetryCount: Boolean = true) {
-        if (closed || !hasPermissions()) return
-        stopScan(notify = false)
-        cancelPairingTimeout()
-        cancelRetry()
-        sessionGeneration += 1
-        manualDisconnect = false
-        closeCurrentGatt()
-        selectedDevice = device
-        rememberAddress(device.address)
-        if (resetRetryCount) retryCount = 0
-        snapshot = MugSnapshot()
-        listener.onSnapshotChanged(device.address, snapshot)
-        changeState(ConnectionState.CONNECTING, "Connecting to ${device.safeLabel()}…")
-        log("Connecting to ${device.safeLabel()} (${device.address.takeLast(5)})")
-        gatt = device.connectGatt(
-            context,
-            false,
-            gattCallback,
-            BluetoothDevice.TRANSPORT_LE,
-            BluetoothDevice.PHY_LE_1M_MASK,
-        )
-        if (gatt == null) {
-            changeState(ConnectionState.DISCONNECTED, "Could not create Bluetooth connection")
+    private fun openGatt(device: BluetoothDevice, autoConnect: Boolean): BluetoothGatt? = runCatching {
+        if (Build.VERSION.SDK_INT >= 37) {
+            val settings = BluetoothGattConnectionSettings.Builder()
+                .setTransport(BluetoothDevice.TRANSPORT_LE)
+                .setAutoConnectEnabled(autoConnect)
+                .build()
+            device.connectGatt(settings, context.mainExecutor, gattCallback)
+        } else {
+            @Suppress("DEPRECATION")
+            device.connectGatt(context, autoConnect, gattCallback, BluetoothDevice.TRANSPORT_LE, BluetoothDevice.PHY_LE_1M_MASK)
         }
-    }
+    }.onFailure { log("connectGatt failed: ${it.message}") }.getOrNull()
 
     private val gattCallback = object : BluetoothGattCallback() {
         override fun onConnectionStateChange(callbackGatt: BluetoothGatt, status: Int, newState: Int) {
@@ -349,36 +397,18 @@ class EmberBleClient(
         }
 
         override fun onServicesDiscovered(callbackGatt: BluetoothGatt, status: Int) {
-            handler.post {
-                if (!isActive(callbackGatt)) return@post
-                if (status != BluetoothGatt.GATT_SUCCESS) {
-                    log("Service discovery failed ($status)")
-                    retryOrDisconnect()
-                    return@post
-                }
-                val discovered = callbackGatt.getService(EmberProtocol.SERVICE)
-                if (discovered == null) {
-                    log("Connected device does not expose the Ember service")
-                    disconnect()
-                    return@post
-                }
-                service = discovered
-                retryCount = 0
-                changeState(ConnectionState.CONNECTED, "Connected · bonded")
-                log("Discovered Ember GATT service with ${discovered.characteristics.size} characteristics")
-                enablePushEvents()
-                enqueueReads()
-            }
+            handler.post { handleServicesDiscovered(callbackGatt, status) }
         }
 
-        @Deprecated("Deprecated in API 33")
+        @Deprecated("Used on API 31–32 only")
+        @Suppress("DEPRECATION")
         override fun onCharacteristicRead(
             callbackGatt: BluetoothGatt,
             characteristic: BluetoothGattCharacteristic,
             status: Int,
         ) {
             if (Build.VERSION.SDK_INT < 33) {
-                val value = characteristic.value ?: byteArrayOf()
+                val value = characteristic.value?.copyOf() ?: byteArrayOf()
                 handler.post { handleCharacteristicRead(callbackGatt, characteristic.uuid, value, status) }
             }
         }
@@ -407,15 +437,16 @@ class EmberBleClient(
         ) {
             handler.post {
                 if (!isActive(callbackGatt) || operationInFlight !is GattOperation.WriteDescriptor) return@post
-                log(if (status == BluetoothGatt.GATT_SUCCESS) "Push events enabled" else "Push events unavailable ($status)")
+                if (status != BluetoothGatt.GATT_SUCCESS) log("Push events unavailable ($status)")
                 finishOperation()
             }
         }
 
-        @Deprecated("Deprecated in API 33")
+        @Deprecated("Used on API 31–32 only")
+        @Suppress("DEPRECATION")
         override fun onCharacteristicChanged(callbackGatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
             if (Build.VERSION.SDK_INT < 33) {
-                val value = characteristic.value ?: byteArrayOf()
+                val value = characteristic.value?.copyOf() ?: byteArrayOf()
                 handler.post { if (isActive(callbackGatt)) handleNotification(characteristic.uuid, value) }
             }
         }
@@ -432,37 +463,160 @@ class EmberBleClient(
     @SuppressLint("MissingPermission")
     private fun handleConnectionState(callbackGatt: BluetoothGatt, status: Int, newState: Int) {
         if (!isActive(callbackGatt)) {
-            if (newState == BluetoothProfile.STATE_DISCONNECTED) callbackGatt.close()
+            if (newState == BluetoothProfile.STATE_DISCONNECTED) runCatching { callbackGatt.close() }
             return
         }
         if (newState == BluetoothProfile.STATE_CONNECTED && status == BluetoothGatt.GATT_SUCCESS) {
-            changeState(ConnectionState.DISCOVERING, "Discovering mug controls…")
-            log("GATT connected; discovering services")
-            if (!callbackGatt.discoverServices()) retryOrDisconnect()
+            backgroundConnect = false
+            changeState(ConnectionState.DISCOVERING, "Loading mug controls…")
+            if (!callbackGatt.discoverServices()) forceReconnect("Service discovery could not start")
             return
         }
         if (newState == BluetoothProfile.STATE_DISCONNECTED || status != BluetoothGatt.GATT_SUCCESS) {
-            service = null
-            clearOperations()
-            gatt = null
-            callbackGatt.close()
-            if (!manualDisconnect && retryCount < MAX_RETRIES && selectedDevice?.bondState == BluetoothDevice.BOND_BONDED) {
-                scheduleRetry(status)
-            } else {
-                changeState(
-                    ConnectionState.DISCONNECTED,
-                    if (manualDisconnect) "Disconnected" else "Connection lost ($status)",
-                )
+            onSessionLost(status)
+        }
+    }
+
+    private fun handleServicesDiscovered(callbackGatt: BluetoothGatt, status: Int) {
+        if (!isActive(callbackGatt)) return
+        if (status != BluetoothGatt.GATT_SUCCESS) {
+            forceReconnect("Service discovery failed ($status)")
+            return
+        }
+        val discovered = callbackGatt.getService(EmberProtocol.SERVICE)
+        if (discovered == null) {
+            log("This device does not expose the Ember service")
+            disconnect()
+            return
+        }
+        service = discovered
+        failures = 0
+        changeState(ConnectionState.CONNECTED, "Connected")
+        log("Connected to ${selectedDevice?.safeLabel()}")
+        enablePushEvents()
+        pendingInitialReads.clear()
+        pendingInitialReads += EmberProtocol.readableCharacteristics.filter { discovered.getCharacteristic(it) != null }
+        enqueueReads()
+        if (pendingInitialReads.isEmpty()) markSynced()
+    }
+
+    /** Called when the active GATT session ended, whether reported by Android or by the watchdog. */
+    @SuppressLint("MissingPermission")
+    private fun onSessionLost(status: Int) {
+        val current = gatt
+        gatt = null
+        service = null
+        clearOperations("Connection lost before the change was confirmed")
+        cancelDisconnectWatchdog()
+        runCatching { current?.close() }
+        val device = selectedDevice
+        if (!wantConnection || device == null || !device.isBondedSafe()) {
+            changeState(ConnectionState.DISCONNECTED, if (wantConnection) "Connection lost ($status)" else "Disconnected")
+            wantConnection = false
+            return
+        }
+        if (!isBluetoothEnabled()) {
+            changeState(ConnectionState.DISCONNECTED, "Bluetooth is off")
+            return
+        }
+        failures += 1
+        when (val action = ReconnectPolicy.next(failures, persistentReconnect)) {
+            is ReconnectAction.Direct -> {
+                if (failures == 1) log("Connection dropped (status $status); retrying")
+                changeState(ConnectionState.CONNECTING, "Reconnecting…")
+                scheduleRetry(action.delayMs) { connect(device, isRetry = true) }
+            }
+            is ReconnectAction.Background -> {
+                if (failures == ReconnectPolicy.MAX_DIRECT_ATTEMPTS + 1) {
+                    log("Mug is out of reach; will reconnect when it wakes up")
+                }
+                changeState(ConnectionState.CONNECTING, "Waiting for ${device.safeLabel()} to wake up…")
+                scheduleRetry(action.delayMs) { connect(device, isRetry = true, background = true) }
+            }
+            ReconnectAction.GiveUp -> {
+                wantConnection = false
+                log("Could not reach the mug (status $status)")
+                changeState(ConnectionState.DISCONNECTED, "Mug not reachable. Make sure it is nearby and awake")
             }
         }
     }
 
-    private fun handleCharacteristicRead(
-        callbackGatt: BluetoothGatt,
-        uuid: UUID,
-        value: ByteArray,
-        status: Int,
-    ) {
+    /** Asks Android to drop the link; if it never reports back, treat the session as lost anyway. */
+    @SuppressLint("MissingPermission")
+    private fun forceReconnect(reason: String) {
+        log(reason)
+        val current = gatt ?: return
+        runCatching { current.disconnect() }
+        cancelDisconnectWatchdog()
+        disconnectWatchdog = Runnable {
+            disconnectWatchdog = null
+            if (gatt === current) onSessionLost(BluetoothGatt.GATT_FAILURE)
+        }.also { handler.postDelayed(it, DISCONNECT_WATCHDOG_MS) }
+    }
+
+    /** Closes the current GATT session and cancels pending work without changing [state]. */
+    @SuppressLint("MissingPermission")
+    private fun teardown() {
+        cancelPairingTimeout()
+        cancelRetry()
+        cancelDisconnectWatchdog()
+        backgroundConnect = false
+        val current = gatt
+        gatt = null
+        service = null
+        clearOperations("Connection closed before the change was confirmed")
+        runCatching {
+            current?.disconnect()
+            current?.close()
+        }
+    }
+
+    private fun scheduleRetry(delayMs: Long, action: () -> Unit) {
+        cancelRetry()
+        retryRunnable = Runnable {
+            retryRunnable = null
+            if (!closed && wantConnection) action()
+        }.also { handler.postDelayed(it, delayMs) }
+    }
+
+    private fun cancelRetry() {
+        retryRunnable?.let(handler::removeCallbacks)
+        retryRunnable = null
+    }
+
+    private fun cancelDisconnectWatchdog() {
+        disconnectWatchdog?.let(handler::removeCallbacks)
+        disconnectWatchdog = null
+    }
+
+    private fun schedulePairingTimeout(device: BluetoothDevice) {
+        cancelPairingTimeout()
+        pairingTimeout = Runnable {
+            pairingTimeout = null
+            if (closed || state != ConnectionState.PAIRING || selectedDevice?.address != device.address) return@Runnable
+            if (device.isBondedSafe()) {
+                connect(device)
+            } else {
+                wantConnection = false
+                log("Pairing timed out")
+                changeState(
+                    ConnectionState.DISCONNECTED,
+                    "Pairing timed out. Hold the mug's button until it pulses blue, then try again",
+                )
+            }
+        }.also { handler.postDelayed(it, PAIRING_TIMEOUT_MS) }
+    }
+
+    private fun cancelPairingTimeout() {
+        pairingTimeout?.let(handler::removeCallbacks)
+        pairingTimeout = null
+    }
+
+    // endregion
+
+    // region GATT operations
+
+    private fun handleCharacteristicRead(callbackGatt: BluetoothGatt, uuid: UUID, value: ByteArray, status: Int) {
         val operation = operationInFlight as? GattOperation.Read
         if (!isActive(callbackGatt) || operation?.characteristicUuid != uuid) return
         if (status == BluetoothGatt.GATT_SUCCESS) {
@@ -471,19 +625,18 @@ class EmberBleClient(
                 if (valuesEquivalent(uuid, pending.value, value)) {
                     listener.onWriteStatus(BleWriteStatus(BleWritePhase.CONFIRMED, uuid, pending.description))
                 } else {
-                    val message = "Write verification failed: ${shortUuid(uuid)}"
-                    log(message)
+                    val message = "The mug did not accept the change"
+                    log("$message (${shortUuid(uuid)})")
                     listener.onWriteStatus(BleWriteStatus(BleWritePhase.FAILED, uuid, message))
                 }
             }
         } else {
             log("Read failed: ${shortUuid(uuid)} ($status)")
             pendingVerifications.remove(uuid)?.let {
-                listener.onWriteStatus(
-                    BleWriteStatus(BleWritePhase.FAILED, uuid, "Could not verify ${shortUuid(uuid)}"),
-                )
+                listener.onWriteStatus(BleWriteStatus(BleWritePhase.FAILED, uuid, "Could not confirm the change"))
             }
         }
+        if (pendingInitialReads.remove(uuid) && pendingInitialReads.isEmpty()) markSynced()
         finishOperation()
     }
 
@@ -491,13 +644,11 @@ class EmberBleClient(
         val operation = operationInFlight as? GattOperation.Write
         if (!isActive(callbackGatt) || operation?.characteristicUuid != uuid) return
         if (status == BluetoothGatt.GATT_SUCCESS) {
-            log("Write accepted; verifying: ${shortUuid(uuid)}")
             pendingVerifications[uuid] = operation
-            enqueueRead(uuid)
+            enqueueRead(uuid, force = true)
         } else {
-            val message = "Write failed: ${shortUuid(uuid)} ($status)"
+            val message = "The mug rejected the change ($status)"
             log(message)
-            pendingVerifications.remove(uuid)
             listener.onWriteStatus(BleWriteStatus(BleWritePhase.FAILED, uuid, message))
         }
         finishOperation()
@@ -506,26 +657,26 @@ class EmberBleClient(
     private fun handleNotification(uuid: UUID, value: ByteArray) {
         if (uuid != EmberProtocol.PUSH_EVENT || value.isEmpty()) return
         when (value[0].toInt() and 0xff) {
-            1, 2, 3 -> enqueueRead(EmberProtocol.BATTERY)
-            4 -> enqueueRead(EmberProtocol.TARGET_TEMPERATURE)
-            5 -> enqueueRead(EmberProtocol.CURRENT_TEMPERATURE)
-            7 -> enqueueRead(EmberProtocol.LIQUID_LEVEL)
-            8 -> enqueueRead(EmberProtocol.LIQUID_STATE)
-            6 -> log("Mug reported missing setup authorization")
+            PushEvent.BATTERY_CHANGED, PushEvent.CHARGING, PushEvent.NOT_CHARGING -> enqueueRead(EmberProtocol.BATTERY)
+            PushEvent.TARGET_TEMPERATURE_CHANGED -> enqueueRead(EmberProtocol.TARGET_TEMPERATURE)
+            PushEvent.CURRENT_TEMPERATURE_CHANGED -> enqueueRead(EmberProtocol.CURRENT_TEMPERATURE)
+            PushEvent.LIQUID_LEVEL_CHANGED -> enqueueRead(EmberProtocol.LIQUID_LEVEL)
+            PushEvent.LIQUID_STATE_CHANGED -> enqueueRead(EmberProtocol.LIQUID_STATE)
+            PushEvent.AUTH_INFO_MISSING -> log("Mug reported missing setup authorization")
         }
     }
 
     private fun updateSnapshot(uuid: UUID, value: ByteArray) {
+        val previous = snapshot
         snapshot = when (uuid) {
-            EmberProtocol.NAME -> snapshot.copy(name = value.toString(Charsets.UTF_8).trimEnd('\u0000'))
+            EmberProtocol.NAME -> snapshot.copy(name = EmberProtocol.decodeName(value))
             EmberProtocol.CURRENT_TEMPERATURE -> snapshot.copy(currentTemperatureC = EmberProtocol.decodeTemperature(value))
             EmberProtocol.TARGET_TEMPERATURE -> snapshot.copy(targetTemperatureC = EmberProtocol.decodeTemperature(value))
             EmberProtocol.TEMPERATURE_UNIT -> snapshot.copy(temperatureUnit = value.firstOrNull()?.toInt()?.and(0xff))
             EmberProtocol.LIQUID_LEVEL -> snapshot.copy(liquidLevel = value.firstOrNull()?.toInt()?.and(0xff))
-            EmberProtocol.BATTERY -> snapshot.copy(
-                batteryPercent = value.getOrNull(0)?.toInt()?.and(0xff),
-                charging = value.getOrNull(1)?.toInt() == 1,
-            )
+            EmberProtocol.BATTERY -> EmberProtocol.decodeBattery(value)?.let {
+                snapshot.copy(batteryPercent = it.percent, charging = it.charging ?: snapshot.charging)
+            } ?: snapshot
             EmberProtocol.LIQUID_STATE -> snapshot.copy(liquidState = value.firstOrNull()?.toInt()?.and(0xff))
             EmberProtocol.FIRMWARE -> EmberProtocol.decodeFirmware(value)?.let { info ->
                 snapshot.copy(
@@ -535,10 +686,20 @@ class EmberBleClient(
                 )
             } ?: snapshot
             EmberProtocol.UDSK -> snapshot.copy(setupKeyPresent = value.any { it.toInt() != 0 })
-            EmberProtocol.LED -> snapshot.copy(ledRgba = value.take(4).map { it.toInt() and 0xff }.toIntArray())
+            EmberProtocol.LED -> snapshot.copy(ledColor = EmberProtocol.decodeLedColor(value))
             else -> snapshot
         }
-        selectedDevice?.address?.let { listener.onSnapshotChanged(it, snapshot) }
+        if (snapshot != previous) emitSnapshot()
+    }
+
+    private fun markSynced() {
+        if (synced) return
+        synced = true
+        emitSnapshot()
+    }
+
+    private fun emitSnapshot() {
+        selectedDevice?.address?.let { listener.onSnapshotChanged(it, snapshot, synced) }
     }
 
     @SuppressLint("MissingPermission")
@@ -551,26 +712,30 @@ class EmberBleClient(
     }
 
     private fun enqueueReads() {
-        EmberProtocol.readableCharacteristics.forEach(::enqueueRead)
+        EmberProtocol.readableCharacteristics.forEach { enqueueRead(it) }
     }
 
-    private fun enqueueRead(uuid: UUID) {
+    /**
+     * Queues a read unless an identical one is already waiting. [force] is used for write
+     * verification, which must observe the value after the write rather than a read queued
+     * before it.
+     */
+    private fun enqueueRead(uuid: UUID, force: Boolean = false) {
         val characteristic = service?.getCharacteristic(uuid) ?: return
-        if (operationInFlight is GattOperation.Read && operationInFlight?.characteristicUuid == uuid) return
-        if (operationQueue.any { it is GattOperation.Read && it.characteristicUuid == uuid }) return
+        if (!force && operationQueue.any { it is GattOperation.Read && it.characteristicUuid == uuid }) return
         enqueue(GattOperation.Read(characteristic))
     }
 
-    private fun writeCharacteristic(uuid: UUID, value: ByteArray, description: String) {
+    private fun writeCharacteristic(uuid: UUID, value: ByteArray, description: String, reportStatus: Boolean = true) {
         val characteristic = service?.getCharacteristic(uuid)
         if (state != ConnectionState.CONNECTED || characteristic == null) {
-            failWrite(uuid, "Mug is not ready for this change")
+            if (reportStatus) failWrite(uuid, "The mug isn't connected")
             return
         }
+        // A newer value for the same characteristic supersedes one that has not been sent yet.
         operationQueue.removeIf { it is GattOperation.Write && it.characteristicUuid == uuid }
-        listener.onWriteStatus(BleWriteStatus(BleWritePhase.WRITING, uuid, "Applying: $description"))
+        if (reportStatus) listener.onWriteStatus(BleWriteStatus(BleWritePhase.WRITING, uuid, description))
         enqueue(GattOperation.Write(characteristic, value, description))
-        log(description)
     }
 
     private fun failWrite(uuid: UUID, message: String) {
@@ -589,10 +754,10 @@ class EmberBleClient(
         val currentGatt = gatt ?: return
         val operation = operationQueue.pollFirst() ?: return
         operationInFlight = operation
-        val started = when (operation) {
-            is GattOperation.Read -> currentGatt.readCharacteristic(operation.characteristic)
-            is GattOperation.Write -> {
-                if (Build.VERSION.SDK_INT >= 33) {
+        val started = runCatching {
+            when (operation) {
+                is GattOperation.Read -> currentGatt.readCharacteristic(operation.characteristic)
+                is GattOperation.Write -> if (Build.VERSION.SDK_INT >= 33) {
                     currentGatt.writeCharacteristic(
                         operation.characteristic,
                         operation.value,
@@ -600,13 +765,13 @@ class EmberBleClient(
                     ) == BluetoothStatusCodes.SUCCESS
                 } else {
                     @Suppress("DEPRECATION")
+                    operation.characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                    @Suppress("DEPRECATION")
                     operation.characteristic.value = operation.value
                     @Suppress("DEPRECATION")
                     currentGatt.writeCharacteristic(operation.characteristic)
                 }
-            }
-            is GattOperation.WriteDescriptor -> {
-                if (Build.VERSION.SDK_INT >= 33) {
+                is GattOperation.WriteDescriptor -> if (Build.VERSION.SDK_INT >= 33) {
                     currentGatt.writeDescriptor(operation.descriptor, operation.value) == BluetoothStatusCodes.SUCCESS
                 } else {
                     @Suppress("DEPRECATION")
@@ -615,23 +780,24 @@ class EmberBleClient(
                     currentGatt.writeDescriptor(operation.descriptor)
                 }
             }
-        }
+        }.getOrDefault(false)
         if (!started) {
-            if (operation is GattOperation.Write) failWrite(operation.characteristicUuid, "Could not start GATT write")
-            log("Could not start GATT operation: ${shortUuid(operation.characteristicUuid)}")
             operationInFlight = null
+            if (operation is GattOperation.Write) failWrite(operation.characteristicUuid, "Could not send the change")
+            if (operation is GattOperation.Read) {
+                pendingVerifications.remove(operation.characteristicUuid)?.let {
+                    failWrite(operation.characteristicUuid, "Could not confirm the change")
+                }
+                if (pendingInitialReads.remove(operation.characteristicUuid) && pendingInitialReads.isEmpty()) markSynced()
+            }
+            log("Could not start GATT operation: ${shortUuid(operation.characteristicUuid)}")
             handler.post(::startNextOperation)
             return
         }
         operationTimeout = Runnable {
+            operationTimeout = null
             if (operationInFlight !== operation || gatt !== currentGatt) return@Runnable
-            val message = "GATT operation timed out: ${shortUuid(operation.characteristicUuid)}"
-            log(message)
-            if (operation is GattOperation.Write) {
-                pendingVerifications.remove(operation.characteristicUuid)
-                listener.onWriteStatus(BleWriteStatus(BleWritePhase.FAILED, operation.characteristicUuid, message))
-            }
-            retryOrDisconnect()
+            forceReconnect("Mug stopped responding (${shortUuid(operation.characteristicUuid)})")
         }.also { handler.postDelayed(it, OPERATION_TIMEOUT_MS) }
     }
 
@@ -642,43 +808,54 @@ class EmberBleClient(
         startNextOperation()
     }
 
-    private fun clearOperations() {
+    /** Drops queued work; any write that was not yet confirmed is reported as failed. */
+    private fun clearOperations(failureMessage: String) {
         operationTimeout?.let(handler::removeCallbacks)
         operationTimeout = null
+        val unconfirmed = buildList {
+            (operationInFlight as? GattOperation.Write)?.let(::add)
+            operationQueue.filterIsInstance<GattOperation.Write>().forEach(::add)
+            addAll(pendingVerifications.values)
+        }
         operationQueue.clear()
         operationInFlight = null
         pendingVerifications.clear()
+        pendingInitialReads.clear()
+        unconfirmed.distinctBy { it.characteristicUuid }.forEach {
+            listener.onWriteStatus(BleWriteStatus(BleWritePhase.FAILED, it.characteristicUuid, failureMessage))
+        }
     }
+
+    // endregion
+
+    // region Scanning
 
     @SuppressLint("MissingPermission")
     private fun acceptScanResult(result: ScanResult) {
         val device = result.device
-        val cached = scanResults[device.address]
         val record = result.scanRecord
-        val name = record?.deviceName ?: runCatching { device.name }.getOrNull() ?: cached?.name
-        val knownAddress = knownMugs().any { it.address == device.address } || device.address == preferredAddress()
+        val name = record?.deviceName ?: runCatching { device.name }.getOrNull() ?: scanResults[device.address]?.name
+        val known = device.address in scanKnownAddresses
         val hasEmberService = record?.serviceUuids?.contains(ParcelUuid(EmberProtocol.SERVICE)) == true
-        val hasEmberManufacturer = record?.manufacturerSpecificData
-            ?.indexOfKey(EMBER_MANUFACTURER_ID)
-            ?.let { it >= 0 } == true
-        if (!knownAddress && name?.contains("Ember", ignoreCase = true) != true && !hasEmberService && !hasEmberManufacturer) return
-        scanResults[device.address] = device.toCandidate(result.rssi, name ?: "Ember mug")
-        emitCandidates()
+        val hasEmberManufacturer = record?.manufacturerSpecificData?.indexOfKey(EMBER_MANUFACTURER_ID)?.let { it >= 0 } == true
+        if (!known && name?.contains("Ember", ignoreCase = true) != true && !hasEmberService && !hasEmberManufacturer) return
+        val candidate = device.toCandidate(result.rssi, name ?: "Ember mug")
+        // RSSI jitters constantly; only re-emit when something visible changes.
+        val previous = scanResults[device.address]
+        scanResults[device.address] = candidate
+        if (previous == null || previous.name != candidate.name || previous.bonded != candidate.bonded ||
+            kotlin.math.abs((previous.rssi ?: 0) - (candidate.rssi ?: 0)) >= RSSI_EMIT_THRESHOLD
+        ) {
+            emitCandidates()
+        }
     }
 
-    @SuppressLint("MissingPermission")
     private fun emitCandidates() {
         if (!hasPermissions()) return
         val combined = linkedMapOf<String, MugCandidate>()
         knownMugs().forEach { combined[it.address] = it }
         scanResults.values.forEach { combined[it.address] = it }
-        listener.onMugCandidates(
-            combined.values.sortedWith(
-                compareByDescending<MugCandidate> { it.address == selectedDevice?.address }
-                    .thenByDescending { it.bonded }
-                    .thenByDescending { it.rssi ?: Int.MIN_VALUE },
-            ),
-        )
+        listener.onMugCandidates(combined.values.toList())
     }
 
     @SuppressLint("MissingPermission")
@@ -686,77 +863,86 @@ class EmberBleClient(
         scanGeneration += 1
         scanTimeout?.let(handler::removeCallbacks)
         scanTimeout = null
-        scanCallback?.let { callback -> adapter?.bluetoothLeScanner?.stopScan(callback) }
+        val callback = scanCallback ?: return
         scanCallback = null
+        runCatching { adapter?.bluetoothLeScanner?.stopScan(callback) }
         if (notify) listener.onScanStateChanged(false, "Scan stopped")
     }
 
-    private fun scheduleRetry(status: Int) {
-        retryCount += 1
-        val generation = ++sessionGeneration
-        val device = selectedDevice ?: return
-        val delay = RETRY_DELAY_MS * retryCount
-        log("Disconnected (status $status); retry $retryCount/$MAX_RETRIES")
-        changeState(ConnectionState.CONNECTING, "Reconnecting…")
-        retryRunnable = Runnable {
-            retryRunnable = null
-            if (closed || manualDisconnect || generation != sessionGeneration) return@Runnable
-            connect(device, resetRetryCount = false)
-        }.also { handler.postDelayed(it, delay) }
+    // endregion
+
+    private val systemReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            when (intent.action) {
+                BluetoothAdapter.ACTION_STATE_CHANGED -> onAdapterStateChanged(
+                    intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR),
+                )
+                BluetoothDevice.ACTION_BOND_STATE_CHANGED -> {
+                    val device = IntentCompat.getParcelableExtra(intent, BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java)
+                        ?: return
+                    onBondStateChanged(device, intent.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE, BluetoothDevice.ERROR))
+                }
+            }
+        }
     }
 
-    private fun cancelRetry() {
-        retryRunnable?.let(handler::removeCallbacks)
-        retryRunnable = null
+    // Declared after systemReceiver: initializers run in source order.
+    init {
+        ContextCompat.registerReceiver(
+            context,
+            systemReceiver,
+            IntentFilter().apply {
+                addAction(BluetoothDevice.ACTION_BOND_STATE_CHANGED)
+                addAction(BluetoothAdapter.ACTION_STATE_CHANGED)
+            },
+            // Bluetooth broadcasts can originate from the Bluetooth stack app rather than the
+            // system UID, so the receiver must be exported to get them. Both actions are
+            // protected broadcasts that ordinary apps cannot send.
+            ContextCompat.RECEIVER_EXPORTED,
+        )
     }
 
-    @SuppressLint("MissingPermission")
-    private fun schedulePairingTimeout(device: BluetoothDevice) {
-        cancelPairingTimeout()
-        pairingTimeout = Runnable {
-            pairingTimeout = null
-            if (
-                closed || manualDisconnect || state != ConnectionState.PAIRING ||
-                selectedDevice?.address != device.address
-            ) return@Runnable
-            if (device.bondState == BluetoothDevice.BOND_BONDED) {
-                log("Bluetooth bond established before pairing timeout")
+    private fun onAdapterStateChanged(adapterState: Int) {
+        if (closed) return
+        when (adapterState) {
+            BluetoothAdapter.STATE_TURNING_OFF, BluetoothAdapter.STATE_OFF -> {
+                stopScan(notify = false)
+                if (gatt != null || retryRunnable != null || state != ConnectionState.DISCONNECTED) {
+                    teardown()
+                    changeState(ConnectionState.DISCONNECTED, "Bluetooth is off")
+                }
+            }
+            BluetoothAdapter.STATE_ON -> {
+                val device = selectedDevice
+                if (wantConnection && device != null && device.isBondedSafe()) {
+                    log("Bluetooth is back on; reconnecting")
+                    connect(device)
+                }
+            }
+        }
+    }
+
+    private fun onBondStateChanged(device: BluetoothDevice, bondState: Int) {
+        if (closed || device.address != selectedDevice?.address || state != ConnectionState.PAIRING) return
+        when (bondState) {
+            BluetoothDevice.BOND_BONDED -> {
+                cancelPairingTimeout()
+                scanResults[device.address]?.let { scanResults[device.address] = it.copy(bonded = true) }
+                emitCandidates()
+                log("Paired with ${device.safeLabel()}")
                 connect(device)
-            } else {
+            }
+            BluetoothDevice.BOND_NONE -> {
+                cancelPairingTimeout()
+                wantConnection = false
+                emitCandidates()
+                log("Pairing was not completed")
                 changeState(
                     ConnectionState.DISCONNECTED,
-                    "Pairing timed out. Put the mug in pairing mode until it pulses blue, then try again",
+                    "Pairing failed. Hold the mug's button until it pulses blue, then try again",
                 )
-                log("Bluetooth pairing timed out")
             }
-        }.also { handler.postDelayed(it, PAIRING_TIMEOUT_MS) }
-    }
-
-    private fun cancelPairingTimeout() {
-        pairingTimeout?.let(handler::removeCallbacks)
-        pairingTimeout = null
-    }
-
-    private fun beginIntentionalTransition() {
-        manualDisconnect = true
-        sessionGeneration += 1
-        cancelPairingTimeout()
-        cancelRetry()
-    }
-
-    @SuppressLint("MissingPermission")
-    private fun closeCurrentGatt() {
-        val current = gatt
-        gatt = null
-        service = null
-        clearOperations()
-        current?.disconnect()
-        current?.close()
-    }
-
-    @SuppressLint("MissingPermission")
-    private fun retryOrDisconnect() {
-        gatt?.disconnect()
+        }
     }
 
     private fun isActive(callbackGatt: BluetoothGatt): Boolean = !closed && callbackGatt === gatt
@@ -766,96 +952,59 @@ class EmberBleClient(
         listener.onConnectionStateChanged(newState, detail, selectedDevice?.address)
     }
 
-    private fun log(message: String) {
-        listener.onLog(message)
-    }
-
-    private fun registerBondReceiver() {
-        ContextCompat.registerReceiver(
-            context,
-            bondReceiver,
-            IntentFilter(BluetoothDevice.ACTION_BOND_STATE_CHANGED),
-            // Bluetooth broadcasts can originate from the privileged Bluetooth stack app,
-            // not only the system UID. Android requires an exported dynamic receiver for
-            // those broadcasts; the action itself is a protected system broadcast.
-            ContextCompat.RECEIVER_EXPORTED,
-        )
-        receiverRegistered = true
-    }
-
-    private val bondReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context, intent: Intent) {
-            val device = if (Build.VERSION.SDK_INT >= 33) {
-                intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java)
-            } else {
-                @Suppress("DEPRECATION")
-                intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
-            } ?: return
-            if (device.address != selectedDevice?.address) return
-            if (state != ConnectionState.PAIRING || manualDisconnect) return
-            when (intent.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE, BluetoothDevice.ERROR)) {
-                BluetoothDevice.BOND_BONDED -> {
-                    cancelPairingTimeout()
-                    scanResults[device.address]?.let { scanResults[device.address] = it.copy(bonded = true) }
-                    emitCandidates()
-                    log("Bluetooth bond established")
-                    connect(device)
-                }
-                BluetoothDevice.BOND_NONE -> {
-                    cancelPairingTimeout()
-                    scanResults[device.address]?.let { scanResults[device.address] = it.copy(bonded = false) }
-                    emitCandidates()
-                    changeState(
-                        ConnectionState.DISCONNECTED,
-                        "Pairing failed. Put the mug in pairing mode until it pulses blue, then try again",
-                    )
-                    log("Bluetooth bond was not established")
-                }
-            }
-        }
-    }
+    private fun log(message: String) = listener.onLog(message)
 
     @SuppressLint("MissingPermission")
-    private fun BluetoothDevice.isEmber(): Boolean = name?.contains("Ember", ignoreCase = true) == true
+    private fun BluetoothDevice.isEmber(): Boolean =
+        runCatching { name }.getOrNull()?.contains("Ember", ignoreCase = true) == true
 
     @SuppressLint("MissingPermission")
-    private fun BluetoothDevice.safeLabel(): String = name ?: "Ember mug"
+    private fun BluetoothDevice.isBondedSafe(): Boolean =
+        runCatching { bondState == BluetoothDevice.BOND_BONDED }.getOrDefault(false)
+
+    @SuppressLint("MissingPermission")
+    private fun BluetoothDevice.safeLabel(): String = runCatching { name }.getOrNull() ?: "your mug"
 
     @SuppressLint("MissingPermission")
     private fun BluetoothDevice.toCandidate(rssi: Int?, overrideName: String? = null): MugCandidate = MugCandidate(
         address = address,
-        name = overrideName ?: name ?: "Ember mug",
+        name = overrideName ?: runCatching { name }.getOrNull() ?: "Ember mug",
         rssi = rssi,
-        bonded = bondState == BluetoothDevice.BOND_BONDED,
+        bonded = isBondedSafe(),
     )
 
     private fun shortUuid(uuid: UUID): String = uuid.toString().substring(4, 8)
 
+    private fun rememberedAddresses(): Set<String> =
+        preferences.getStringSet(PREF_KNOWN_ADDRESSES, emptySet()).orEmpty()
+
     private fun rememberAddress(address: String) {
-        val addresses = preferences.getStringSet(PREF_KNOWN_ADDRESSES, emptySet()).orEmpty().toMutableSet()
-        addresses.add(address)
+        val addresses = rememberedAddresses() + address
         preferences.edit {
             putString(PREF_ADDRESS, address)
             putStringSet(PREF_KNOWN_ADDRESSES, addresses)
         }
     }
 
-    private fun valuesEquivalent(uuid: UUID, expected: ByteArray, actual: ByteArray): Boolean {
-        return if (uuid == EmberProtocol.NAME) {
-            actual.toString(Charsets.UTF_8).trimEnd('\u0000') == expected.toString(Charsets.US_ASCII)
-        } else {
-            actual.take(expected.size).toByteArray().contentEquals(expected)
-        }
+    private fun valuesEquivalent(uuid: UUID, expected: ByteArray, actual: ByteArray): Boolean = when (uuid) {
+        EmberProtocol.NAME -> EmberProtocol.decodeName(actual) == expected.toString(Charsets.US_ASCII)
+        // Only RGB matters; some firmware reports a different alpha byte than was written.
+        EmberProtocol.LED -> EmberProtocol.decodeLedColor(actual) == EmberProtocol.decodeLedColor(expected)
+        else -> actual.size >= expected.size && actual.copyOf(expected.size).contentEquals(expected)
     }
 
-    private companion object {
-        const val PREF_ADDRESS = "preferred_mug_address"
-        const val PREF_KNOWN_ADDRESSES = "known_mug_addresses"
-        const val EMBER_MANUFACTURER_ID = 0x03C1
-        const val SCAN_DURATION_MS = 8_000L
-        const val RETRY_DELAY_MS = 1_200L
-        const val OPERATION_TIMEOUT_MS = 8_000L
-        const val PAIRING_TIMEOUT_MS = 30_000L
-        const val MAX_RETRIES = 3
+    enum class ConnectResult { STARTED, NEEDS_CHOICE, BLUETOOTH_OFF, NO_PERMISSION, UNAVAILABLE }
+
+    companion object {
+        val REQUIRED_PERMISSIONS = arrayOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT)
+
+        private const val PREF_ADDRESS = "preferred_mug_address"
+        private const val PREF_KNOWN_ADDRESSES = "known_mug_addresses"
+        private const val EMBER_MANUFACTURER_ID = 0x03C1
+        private const val SCAN_DURATION_MS = 10_000L
+        private const val OPERATION_TIMEOUT_MS = 8_000L
+        private const val DISCONNECT_WATCHDOG_MS = 4_000L
+        private const val PAIRING_TIMEOUT_MS = 45_000L
+        private const val RSSI_EMIT_THRESHOLD = 4
     }
 }

@@ -1,9 +1,13 @@
 package dev.nicky.ember.data
 
 import android.content.Context
+import android.os.Handler
+import android.os.Looper
 import dev.nicky.ember.BackgroundMonitoringPolicy
 import dev.nicky.ember.EmberConnectionService
+import dev.nicky.ember.EmberTileService
 import dev.nicky.ember.EmberWidgetProvider
+import dev.nicky.ember.ExternalState
 import dev.nicky.ember.ble.BleWritePhase
 import dev.nicky.ember.ble.BleWriteStatus
 import dev.nicky.ember.ble.ConnectionState
@@ -19,63 +23,88 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
+/**
+ * Single source of truth shared by the activity, the monitoring service, the widget and the
+ * Quick Settings tile. All methods must be called on the main thread.
+ */
 class EmberRepository(private val context: Context) : EmberBleClient.Listener {
     private val preferences = EmberPreferences(context)
     private val client = EmberBleClient(context, this)
+    private val handler = Handler(Looper.getMainLooper())
     private val timeFormat = SimpleDateFormat("HH:mm:ss", Locale.US)
 
-    private val initialAddress = client.preferredAddress()
-    private val initialCachedSnapshot = preferences.cachedSnapshot(initialAddress)
-    private val _state = MutableStateFlow(
-        EmberAppState(
-            selectedAddress = initialAddress,
-            snapshotAddress = initialAddress,
-            snapshot = initialCachedSnapshot.first,
-            snapshotUpdatedAt = initialCachedSnapshot.second,
-            snapshotFresh = false,
-            profiles = preferences.profiles(),
-            displayUnit = preferences.displayUnit(),
-            presetsCelsius = preferences.presets(),
-            backgroundMonitoring = preferences.backgroundMonitoring(),
-        ),
-    )
-    val state: StateFlow<EmberAppState> = _state.asStateFlow()
+    private val _state: MutableStateFlow<EmberAppState>
+    val state: StateFlow<EmberAppState>
 
-    private var started = false
-    private var pendingTargetAfterConnect: Float? = null
-    @Volatile private var appVisible = false
+    /** Cached values for [EmberAppState.snapshotAddress]; live reads are layered on top. */
+    private var baseSnapshot: MugSnapshot
+    private var lastPersisted: MugSnapshot? = null
+    private var sessionSynced = false
+    private var unitSyncedThisSession = false
+    private var pendingTarget: Float? = null
+    private var appVisible = false
+    private var serviceRequested = false
+    private var serviceStartBlocked = false
+    private var quickActionsInFlight = 0
+    private var lastExternalState: ExternalState? = null
+    private var writeSequence = 0L
 
-    fun start(): Boolean {
-        if (started) return false
-        started = true
-        refreshKnownMugs(client.knownMugs())
-        if (BackgroundMonitoringPolicy.shouldRunService(_state.value)) {
-            EmberConnectionService.setEnabled(context, true)
-        } else if (_state.value.backgroundMonitoring && BackgroundMonitoringPolicy.isKnownEmpty(_state.value)) {
-            EmberConnectionService.pauseForEmptyMug(context)
+    private val idleDisconnect = Runnable {
+        if (!appVisible && !serviceRequested && quickActionsInFlight == 0 && _state.value.connectionState != ConnectionState.DISCONNECTED) {
+            appendLog("Disconnected while the app is in the background")
+            client.disconnect()
         }
-        return true
+    }
+    private val pendingTargetTimeout = Runnable {
+        if (pendingTarget != null) {
+            pendingTarget = null
+            publishWriteStatus(WritePhase.FAILED, "Couldn't reach the mug to apply the change")
+        }
     }
 
-    fun hasPermissions(): Boolean = client.hasPermissions()
+    init {
+        val address = client.preferredAddress()
+        val (cached, updatedAt) = preferences.cachedSnapshot(address)
+        baseSnapshot = cached
+        lastPersisted = cached
+        _state = MutableStateFlow(
+            EmberAppState(
+                bluetoothEnabled = client.isBluetoothEnabled(),
+                hasPermissions = client.hasPermissions(),
+                selectedAddress = address,
+                snapshotAddress = address,
+                snapshot = cached,
+                snapshotUpdatedAt = updatedAt,
+                profiles = preferences.profiles(),
+                displayUnit = preferences.displayUnit(),
+                presetsCelsius = preferences.presets(),
+                backgroundMonitoring = preferences.backgroundMonitoring(),
+            ),
+        )
+        state = _state.asStateFlow()
+        refreshKnownMugs(client.knownMugs())
+    }
 
-    fun connectPreferred() {
-        start()
-        client.connectPreferred()
+    // region Commands
+
+    /** Re-reads permission and adapter state, e.g. after the user granted access. */
+    fun refreshEnvironment() {
+        _state.update { it.copy(hasPermissions = client.hasPermissions(), bluetoothEnabled = client.isBluetoothEnabled()) }
+        refreshKnownMugs(client.knownMugs())
+        syncMonitoring()
+    }
+
+    fun connectPreferred(): EmberBleClient.ConnectResult {
+        refreshEnvironment()
+        return client.connectPreferred()
     }
 
     fun disconnect() {
-        pendingTargetAfterConnect = null
+        clearPendingTarget()
         client.disconnect()
     }
 
-    fun cancelConnection() {
-        pendingTargetAfterConnect = null
-        client.cancelConnection()
-    }
-
     fun startMugScan() {
-        start()
         refreshKnownMugs(client.knownMugs())
         client.scanForMugs()
     }
@@ -83,21 +112,38 @@ class EmberRepository(private val context: Context) : EmberBleClient.Listener {
     fun stopMugScan() = client.stopMugScan()
 
     fun selectMug(address: String) {
-        pendingTargetAfterConnect = null
+        clearPendingTarget()
         client.selectMug(address)
+    }
+
+    fun forgetMug(address: String) {
+        if (address == _state.value.selectedAddress) return
+        preferences.forget(address)
+        refreshKnownMugs(_state.value.mugChoices.map(MugChoice::candidate).filterNot { it.address == address && !it.bonded })
+        appendLog("Removed a saved mug")
     }
 
     fun refresh() = client.refresh()
 
     fun setTargetTemperature(celsius: Float) {
+        if (!EmberProtocol.isValidTarget(celsius)) return
         if (_state.value.connected) {
+            clearPendingTarget()
             client.setTargetTemperature(celsius)
-        } else {
-            pendingTargetAfterConnect = celsius
-            _state.update {
-                it.copy(writeStatus = WriteStatus(WritePhase.WRITING, "Connecting before applying change…"))
+            return
+        }
+        pendingTarget = celsius
+        handler.removeCallbacks(pendingTargetTimeout)
+        handler.postDelayed(pendingTargetTimeout, PENDING_TARGET_TIMEOUT_MS)
+        publishWriteStatus(WritePhase.WRITING, "Connecting to apply the change…")
+        if (_state.value.connectionState == ConnectionState.DISCONNECTED) {
+            when (connectPreferred()) {
+                EmberBleClient.ConnectResult.STARTED -> Unit
+                else -> {
+                    clearPendingTarget()
+                    publishWriteStatus(WritePhase.FAILED, "Couldn't reach the mug to apply the change")
+                }
             }
-            client.connectPreferred()
         }
     }
 
@@ -109,7 +155,7 @@ class EmberRepository(private val context: Context) : EmberBleClient.Listener {
     }
 
     fun setPresets(values: List<Float>) {
-        val safeValues = values.map { it.coerceIn(49f, 63f) }
+        val safeValues = values.map { it.coerceIn(EmberProtocol.MIN_TARGET_CELSIUS, EmberProtocol.MAX_TARGET_CELSIUS) }
         preferences.setPresets(safeValues)
         _state.update { it.copy(presetsCelsius = safeValues) }
         publishExternalState()
@@ -119,7 +165,7 @@ class EmberRepository(private val context: Context) : EmberBleClient.Listener {
         val address = _state.value.selectedAddress ?: return
         preferences.setNickname(address, nickname)
         refreshProfilesAndChoices()
-        appendLog(if (nickname.isBlank()) "Local mug nickname cleared" else "Local mug nickname set to $nickname")
+        publishExternalState()
     }
 
     fun setHardwareName(name: String) = client.setMugName(name)
@@ -129,101 +175,134 @@ class EmberRepository(private val context: Context) : EmberBleClient.Listener {
     fun setBackgroundMonitoring(enabled: Boolean) {
         preferences.setBackgroundMonitoring(enabled)
         _state.update { it.copy(backgroundMonitoring = enabled) }
-        if (enabled && BackgroundMonitoringPolicy.isKnownEmpty(_state.value)) {
-            EmberConnectionService.pauseForEmptyMug(context)
-        } else {
-            EmberConnectionService.setEnabled(context, enabled && BackgroundMonitoringPolicy.shouldRunService(_state.value))
-        }
+        if (!enabled) EmberConnectionService.cancelNotifications(context)
+        syncMonitoring()
         publishExternalState()
     }
 
     fun setAppVisible(visible: Boolean) {
         appVisible = visible
-        val state = _state.value
-        if (!state.backgroundMonitoring) return
-
         if (visible) {
-            if (state.connectionState == ConnectionState.DISCONNECTED && client.hasPermissions()) {
+            refreshEnvironment()
+            if (_state.value.connectionState == ConnectionState.DISCONNECTED && _state.value.hasPermissions) {
                 client.connectPreferred()
             }
-            if (BackgroundMonitoringPolicy.isKnownEmpty(state)) {
-                EmberConnectionService.pauseForEmptyMug(context)
-            } else {
-                EmberConnectionService.setEnabled(context, BackgroundMonitoringPolicy.shouldRunService(state))
-            }
-        } else if (BackgroundMonitoringPolicy.isKnownEmpty(state)) {
-            EmberConnectionService.pauseForEmptyMug(context)
-            if (state.connectionState != ConnectionState.DISCONNECTED) client.disconnect()
-        } else {
-            EmberConnectionService.setEnabled(context, true)
         }
+        syncMonitoring()
     }
 
+    /**
+     * Runs a widget/tile/notification command, connecting first if needed. [onDone] is invoked
+     * once the change is confirmed, fails, or times out, so callers can release their wake hold.
+     */
+    fun runQuickAction(action: QuickAction, onDone: () -> Unit = {}) {
+        quickActionsInFlight += 1
+        syncMonitoring()
+        val startSequence = _state.value.writeStatus.sequence
+        var finished = false
+        lateinit var watcher: Runnable
+        val finish = {
+            if (!finished) {
+                finished = true
+                handler.removeCallbacks(watcher)
+                quickActionsInFlight -= 1
+                syncMonitoring()
+                onDone()
+            }
+        }
+        val deadline = System.currentTimeMillis() + QUICK_ACTION_TIMEOUT_MS
+        watcher = Runnable {
+            val status = _state.value.writeStatus
+            val settled = status.sequence != startSequence &&
+                (status.phase == WritePhase.CONFIRMED || status.phase == WritePhase.FAILED)
+            if (settled || System.currentTimeMillis() >= deadline) finish() else handler.postDelayed(watcher, 250L)
+        }
+        val state = _state.value
+        when (action) {
+            QuickAction.HEATER_OFF -> setTargetTemperature(EmberProtocol.HEATER_OFF_CELSIUS)
+            QuickAction.PRESET -> state.presetsCelsius.getOrNull(1)?.let(::setTargetTemperature)
+            QuickAction.TOGGLE_HEATER -> if (state.heaterOn) {
+                setTargetTemperature(EmberProtocol.HEATER_OFF_CELSIUS)
+            } else {
+                state.presetsCelsius.getOrNull(1)?.let(::setTargetTemperature)
+            }
+            QuickAction.CONNECT -> {
+                if (!state.connected) connectPreferred()
+                handler.postDelayed({ finish() }, CONNECT_HOLD_MS)
+                return
+            }
+        }
+        handler.post(watcher)
+    }
+
+    // endregion
+
+    // region BLE listener
+
     override fun onConnectionStateChanged(state: ConnectionState, detail: String, selectedAddress: String?) {
-        val addressChanged = selectedAddress != null && selectedAddress != _state.value.snapshotAddress
-        val cached = if (addressChanged) preferences.cachedSnapshot(selectedAddress) else null
-        val pendingFailed = state == ConnectionState.DISCONNECTED && pendingTargetAfterConnect != null && detail != "Disconnected"
-        if (pendingFailed) pendingTargetAfterConnect = null
+        if (state != ConnectionState.CONNECTED) {
+            sessionSynced = false
+            unitSyncedThisSession = false
+        }
+        selectedAddress?.let(::switchSnapshotAddress)
+        val pendingFailed = state == ConnectionState.DISCONNECTED && pendingTarget != null
+        if (pendingFailed) clearPendingTarget()
         _state.update { current ->
             current.copy(
                 connectionState = state,
                 connectionDetail = detail,
+                bluetoothEnabled = client.isBluetoothEnabled(),
                 selectedAddress = selectedAddress ?: current.selectedAddress,
-                snapshotAddress = if (addressChanged) selectedAddress else current.snapshotAddress,
-                snapshot = cached?.first ?: current.snapshot,
-                snapshotUpdatedAt = cached?.second ?: current.snapshotUpdatedAt,
-                snapshotFresh = state == ConnectionState.CONNECTED && !addressChanged && current.snapshotFresh,
-                writeStatus = if (pendingFailed) {
-                    WriteStatus(WritePhase.FAILED, "Could not connect to apply the change")
-                } else if (state == ConnectionState.DISCONNECTED && current.writeStatus.phase == WritePhase.WRITING) {
-                    WriteStatus(WritePhase.FAILED, "Connection ended before the change was confirmed")
-                } else {
-                    current.writeStatus
-                },
+                snapshotFresh = state == ConnectionState.CONNECTED && sessionSynced,
             )
         }
+        if (pendingFailed) publishWriteStatus(WritePhase.FAILED, "Couldn't reach the mug to apply the change")
         refreshProfilesAndChoices()
         if (state == ConnectionState.CONNECTED) {
-            pendingTargetAfterConnect?.let { target ->
-                pendingTargetAfterConnect = null
+            pendingTarget?.let { target ->
+                clearPendingTarget()
                 client.setTargetTemperature(target)
             }
         }
+        syncMonitoring()
         publishExternalState()
     }
 
-    override fun onSnapshotChanged(address: String, snapshot: MugSnapshot) {
-        val previousLiquidState = _state.value.snapshot.liquidState
-        val hasData = snapshot.name != null || snapshot.currentTemperatureC != null || snapshot.batteryPercent != null
-        if (hasData) preferences.persistSnapshot(address, snapshot)
-        snapshot.name?.let { preferences.rememberCandidate(address, it, null) }
+    override fun onSnapshotChanged(address: String, snapshot: MugSnapshot, synced: Boolean) {
+        switchSnapshotAddress(address)
+        sessionSynced = synced
+        val merged = snapshot.withFallback(baseSnapshot)
+        if (synced && merged != lastPersisted && merged.hasData) {
+            preferences.persistSnapshot(address, merged)
+            lastPersisted = merged
+            snapshot.name?.let { name ->
+                if (_state.value.profiles.none { it.address == address && it.advertisedName == name }) {
+                    preferences.rememberCandidate(address, name, null)
+                    refreshProfilesAndChoices()
+                }
+            }
+        }
         _state.update {
             it.copy(
                 selectedAddress = address,
                 snapshotAddress = address,
-                snapshot = snapshot,
-                snapshotUpdatedAt = if (hasData) System.currentTimeMillis() else it.snapshotUpdatedAt,
-                snapshotFresh = hasData && it.connectionState == ConnectionState.CONNECTED,
+                snapshot = merged,
+                snapshotUpdatedAt = if (synced) System.currentTimeMillis() else it.snapshotUpdatedAt,
+                snapshotFresh = synced && it.connected,
             )
         }
-        refreshProfilesAndChoices()
-        publishExternalState()
-
-        val state = _state.value
-        if (BackgroundMonitoringPolicy.isLiveEmpty(state)) {
-            EmberConnectionService.pauseForEmptyMug(context)
-            if (previousLiquidState != 1) appendLog("Background monitoring paused while the mug is empty")
-            if (!appVisible) client.disconnect()
-        } else if (
-            state.backgroundMonitoring &&
-            BackgroundMonitoringPolicy.isRefill(previousLiquidState, snapshot.liquidState)
-        ) {
-            EmberConnectionService.setEnabled(context, true)
+        if (synced && !unitSyncedThisSession && _state.value.connected) {
+            unitSyncedThisSession = true
+            val wantFahrenheit = _state.value.displayUnit == DisplayUnit.FAHRENHEIT
+            val mugUnit = merged.temperatureUnit
+            if (mugUnit != null && (mugUnit == 1) != wantFahrenheit) client.setTemperatureUnit(wantFahrenheit)
         }
+        syncMonitoring()
+        publishExternalState()
     }
 
     override fun onMugCandidates(candidates: List<MugCandidate>) {
-        candidates.forEach { preferences.rememberCandidate(it.address, it.name, it.rssi) }
+        candidates.filter { it.rssi != null }.forEach { preferences.rememberCandidate(it.address, it.name, it.rssi) }
         refreshKnownMugs(candidates)
     }
 
@@ -232,7 +311,7 @@ class EmberRepository(private val context: Context) : EmberBleClient.Listener {
             it.copy(
                 scanState = when {
                     scanning -> ScanState.SCANNING
-                    detail.startsWith("Scan failed") || detail.contains("unavailable") -> ScanState.FAILED
+                    detail.startsWith("Scan failed") || detail.contains("unavailable") || detail.contains("off") -> ScanState.FAILED
                     else -> ScanState.COMPLETE
                 },
                 scanDetail = detail,
@@ -241,22 +320,71 @@ class EmberRepository(private val context: Context) : EmberBleClient.Listener {
     }
 
     override fun onWriteStatus(status: BleWriteStatus) {
-        _state.update {
-            it.copy(
-                writeStatus = WriteStatus(
-                    phase = when (status.phase) {
-                        BleWritePhase.WRITING -> WritePhase.WRITING
-                        BleWritePhase.CONFIRMED -> WritePhase.CONFIRMED
-                        BleWritePhase.FAILED -> WritePhase.FAILED
-                    },
-                    message = status.message,
-                ),
-            )
-        }
-        publishExternalState()
+        publishWriteStatus(
+            when (status.phase) {
+                BleWritePhase.WRITING -> WritePhase.WRITING
+                BleWritePhase.CONFIRMED -> WritePhase.CONFIRMED
+                BleWritePhase.FAILED -> WritePhase.FAILED
+            },
+            status.message,
+        )
+        if (status.phase == BleWritePhase.FAILED) appendLog(status.message)
     }
 
     override fun onLog(message: String) = appendLog(message)
+
+    // endregion
+
+    private fun switchSnapshotAddress(address: String) {
+        if (address == _state.value.snapshotAddress) return
+        val (cached, updatedAt) = preferences.cachedSnapshot(address)
+        baseSnapshot = cached
+        lastPersisted = cached
+        sessionSynced = false
+        _state.update {
+            it.copy(snapshotAddress = address, snapshot = cached, snapshotUpdatedAt = updatedAt, snapshotFresh = false)
+        }
+    }
+
+    /**
+     * Decides whether the foreground monitoring service should run and how hard the BLE client
+     * should try to stay connected, then schedules an idle disconnect when nothing needs the mug.
+     */
+    private fun syncMonitoring() {
+        val current = _state.value
+        val wantService = BackgroundMonitoringPolicy.shouldRunService(current)
+        if (wantService != serviceRequested) {
+            serviceRequested = if (wantService) EmberConnectionService.start(context) else {
+                EmberConnectionService.stop(context)
+                false
+            }
+            if (wantService && !serviceRequested && !serviceStartBlocked) {
+                serviceStartBlocked = true
+                appendLog("Android blocked background monitoring; open the app to resume it")
+            }
+            if (serviceRequested) serviceStartBlocked = false
+            if (!wantService && current.backgroundMonitoring && BackgroundMonitoringPolicy.isKnownEmpty(current)) {
+                appendLog("Mug is empty; monitoring pauses until it is refilled")
+            }
+        }
+        if (BackgroundMonitoringPolicy.isLiveEmpty(current)) EmberConnectionService.cancelReadyNotification(context)
+        if (current.monitoringActive != serviceRequested) _state.update { it.copy(monitoringActive = serviceRequested) }
+        client.setPersistentReconnect(serviceRequested || appVisible)
+        handler.removeCallbacks(idleDisconnect)
+        if (!appVisible && !serviceRequested && quickActionsInFlight == 0 && current.connectionState != ConnectionState.DISCONNECTED) {
+            handler.postDelayed(idleDisconnect, IDLE_DISCONNECT_MS)
+        }
+    }
+
+    private fun clearPendingTarget() {
+        pendingTarget = null
+        handler.removeCallbacks(pendingTargetTimeout)
+    }
+
+    private fun publishWriteStatus(phase: WritePhase, message: String) {
+        writeSequence += 1
+        _state.update { it.copy(writeStatus = WriteStatus(phase, message, writeSequence)) }
+    }
 
     private fun refreshKnownMugs(candidates: List<MugCandidate>) {
         val profiles = preferences.profiles()
@@ -265,12 +393,7 @@ class EmberRepository(private val context: Context) : EmberBleClient.Listener {
         profiles.forEach { profile ->
             byAddress.putIfAbsent(
                 profile.address,
-                MugCandidate(
-                    address = profile.address,
-                    name = profile.advertisedName,
-                    rssi = profile.lastRssi,
-                    bonded = false,
-                ),
+                MugCandidate(address = profile.address, name = profile.advertisedName, rssi = null, bonded = false),
             )
         }
         val selectedAddress = _state.value.selectedAddress
@@ -283,10 +406,10 @@ class EmberRepository(private val context: Context) : EmberBleClient.Listener {
                 connected = connected && candidate.address == selectedAddress,
             )
         }.sortedWith(
-            compareByDescending<MugChoice> { it.connected }
-                .thenByDescending { it.selected }
+            compareByDescending<MugChoice> { it.selected }
                 .thenByDescending { it.candidate.bonded }
-                .thenByDescending { it.candidate.rssi ?: Int.MIN_VALUE },
+                .thenByDescending { it.candidate.rssi ?: Int.MIN_VALUE }
+                .thenBy { it.displayName },
         )
         _state.update { it.copy(profiles = profiles, mugChoices = choices) }
     }
@@ -300,21 +423,27 @@ class EmberRepository(private val context: Context) : EmberBleClient.Listener {
         _state.update { it.copy(logLines = (listOf(line) + it.logLines).take(MAX_LOG_LINES)) }
     }
 
+    /** Pushes state to the widget and tile, but only when something they display changed. */
     private fun publishExternalState() {
-        EmberWidgetProvider.updateAll(context, _state.value)
+        val external = ExternalState.from(_state.value)
+        if (external == lastExternalState) return
+        lastExternalState = external
+        EmberWidgetProvider.updateAll(context, external)
+        EmberTileService.requestUpdate(context)
     }
 
     companion object {
-        const val MAX_LOG_LINES = 12
-
-        fun displayTemperature(celsius: Float, unit: DisplayUnit): Float = when (unit) {
-            DisplayUnit.CELSIUS -> celsius
-            DisplayUnit.FAHRENHEIT -> EmberProtocol.celsiusToFahrenheit(celsius)
-        }
-
-        fun inputToCelsius(value: Float, unit: DisplayUnit): Float = when (unit) {
-            DisplayUnit.CELSIUS -> value
-            DisplayUnit.FAHRENHEIT -> EmberProtocol.fahrenheitToCelsius(value).coerceIn(49f, 63f)
-        }
+        const val MAX_LOG_LINES = 60
+        private const val IDLE_DISCONNECT_MS = 5_000L
+        private const val PENDING_TARGET_TIMEOUT_MS = 30_000L
+        private const val QUICK_ACTION_TIMEOUT_MS = 9_000L
+        private const val CONNECT_HOLD_MS = 8_000L
     }
+}
+
+enum class QuickAction {
+    HEATER_OFF,
+    PRESET,
+    TOGGLE_HEATER,
+    CONNECT,
 }

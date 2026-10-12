@@ -1,12 +1,16 @@
 package dev.nicky.ember.ble
 
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
 import java.util.UUID
-import kotlin.math.round
+import kotlin.math.roundToInt
 
 object EmberProtocol {
     private const val UUID_TEMPLATE = "fc54%04x-236c-4c94-8fa9-944a3e5353fa"
+
+    const val MIN_TARGET_CELSIUS = 49f
+    const val MAX_TARGET_CELSIUS = 63f
+    const val HEATER_OFF_CELSIUS = 0f
+    const val MAX_NAME_LENGTH = 16
+    const val FULL_LIQUID_LEVEL = 30
 
     val SERVICE: UUID = characteristic(0x3622)
     val NAME: UUID = characteristic(0x0001)
@@ -35,21 +39,29 @@ object EmberProtocol {
         LED,
     )
 
+    fun isValidTarget(celsius: Float): Boolean =
+        celsius == HEATER_OFF_CELSIUS || celsius in MIN_TARGET_CELSIUS..MAX_TARGET_CELSIUS
+
     fun encodeTemperature(celsius: Float): ByteArray {
-        require(celsius == 0f || celsius in 49f..63f) {
+        require(isValidTarget(celsius)) {
             "Temperature must be off (0 °C) or between 49 and 63 °C"
         }
-        val hundredths = (celsius * 100f).toInt()
-        return ByteBuffer.allocate(2)
-            .order(ByteOrder.LITTLE_ENDIAN)
-            .putShort(hundredths.toShort())
-            .array()
+        // Round rather than truncate: 57.3f * 100 is 5729.9995 in binary floating point.
+        val hundredths = (celsius * 100f).roundToInt()
+        return byteArrayOf((hundredths and 0xff).toByte(), ((hundredths shr 8) and 0xff).toByte())
     }
 
     fun decodeTemperature(value: ByteArray): Float? {
         if (value.size < 2) return null
-        val raw = (value[0].toInt() and 0xff) or ((value[1].toInt() and 0xff) shl 8)
-        return raw / 100f
+        return littleEndianU16(value, 0) / 100f
+    }
+
+    fun decodeBattery(value: ByteArray): BatteryInfo? {
+        if (value.isEmpty()) return null
+        return BatteryInfo(
+            percent = (value[0].toInt() and 0xff).coerceIn(0, 100),
+            charging = value.getOrNull(1)?.let { (it.toInt() and 0xff) == 1 },
+        )
     }
 
     fun decodeFirmware(value: ByteArray): FirmwareInfo? {
@@ -61,17 +73,29 @@ object EmberProtocol {
         )
     }
 
-    fun snapTargetForSlider(celsius: Float): Float = round(celsius * 2f) / 2f
+    fun decodeName(value: ByteArray): String = value.toString(Charsets.UTF_8).trimEnd('\u0000').trim()
+
+    /** Returns the colour as 0xRRGGBB, ignoring the trailing alpha byte. */
+    fun decodeLedColor(value: ByteArray): Int? {
+        if (value.size < 3) return null
+        return ((value[0].toInt() and 0xff) shl 16) or
+            ((value[1].toInt() and 0xff) shl 8) or
+            (value[2].toInt() and 0xff)
+    }
+
+    fun snapTargetForSlider(celsius: Float): Float = (celsius * 2f).roundToInt() / 2f
+
+    fun isValidName(name: String): Boolean = NAME_PATTERN.matches(name)
 
     fun encodeName(name: String): ByteArray {
-        require(NAME_PATTERN.matches(name)) {
+        require(isValidName(name)) {
             "Mug name must contain 1–16 supported characters"
         }
         return name.toByteArray(Charsets.US_ASCII)
     }
 
     fun encodeLedColor(red: Int, green: Int, blue: Int): ByteArray {
-        require(red in 0..255 && green in 0..255 && blue in 0..255)
+        require(red in 0..255 && green in 0..255 && blue in 0..255) { "LED channels must be 0–255" }
         return byteArrayOf(red.toByte(), green.toByte(), blue.toByte(), 0xff.toByte())
     }
 
@@ -82,14 +106,14 @@ object EmberProtocol {
     fun fahrenheitToCelsius(fahrenheit: Float): Float = (fahrenheit - 32f) * 5f / 9f
 
     fun liquidStateLabel(code: Int?): String = when (code) {
-        0 -> "Standby"
-        1 -> "Empty"
-        2 -> "Filling"
-        3 -> "Cold · temperature control off"
-        4 -> "Cooling"
-        5 -> "Heating"
-        6 -> "At target temperature"
-        7 -> "Warm · temperature control off"
+        LiquidState.STANDBY -> "Standby"
+        LiquidState.EMPTY -> "Empty"
+        LiquidState.FILLING -> "Filling"
+        LiquidState.COLD_NO_CONTROL -> "Cold · temperature control off"
+        LiquidState.COOLING -> "Cooling"
+        LiquidState.HEATING -> "Heating"
+        LiquidState.AT_TARGET -> "At target temperature"
+        LiquidState.WARM_NO_CONTROL -> "Warm · temperature control off"
         null -> "Waiting for mug"
         else -> "Unknown state ($code)"
     }
@@ -100,8 +124,36 @@ object EmberProtocol {
         return (value[offset].toInt() and 0xff) or ((value[offset + 1].toInt() and 0xff) shl 8)
     }
 
-    private val NAME_PATTERN = Regex("^[A-Za-z0-9,.\\[\\]#()!\"';:|_+<>%= \\-]{1,16}$")
+    private val NAME_PATTERN = Regex("^[A-Za-z0-9,.\\[\\]#()!\"';:|_+<>%= \\-]{1,$MAX_NAME_LENGTH}$")
 }
+
+object LiquidState {
+    const val STANDBY = 0
+    const val EMPTY = 1
+    const val FILLING = 2
+    const val COLD_NO_CONTROL = 3
+    const val COOLING = 4
+    const val HEATING = 5
+    const val AT_TARGET = 6
+    const val WARM_NO_CONTROL = 7
+}
+
+/** Push-event identifiers sent on [EmberProtocol.PUSH_EVENT]. */
+object PushEvent {
+    const val BATTERY_CHANGED = 1
+    const val CHARGING = 2
+    const val NOT_CHARGING = 3
+    const val TARGET_TEMPERATURE_CHANGED = 4
+    const val CURRENT_TEMPERATURE_CHANGED = 5
+    const val AUTH_INFO_MISSING = 6
+    const val LIQUID_LEVEL_CHANGED = 7
+    const val LIQUID_STATE_CHANGED = 8
+}
+
+data class BatteryInfo(
+    val percent: Int,
+    val charging: Boolean?,
+)
 
 data class FirmwareInfo(
     val firmware: Int,
@@ -122,8 +174,29 @@ data class MugSnapshot(
     val hardwareVersion: Int? = null,
     val bootloaderVersion: Int? = null,
     val setupKeyPresent: Boolean? = null,
-    val ledRgba: IntArray? = null,
-)
+    /** LED colour as 0xRRGGBB. */
+    val ledColor: Int? = null,
+) {
+    val hasData: Boolean
+        get() = name != null || currentTemperatureC != null || batteryPercent != null || liquidState != null
+
+    /** Fills every field this snapshot has not read yet from [base]. */
+    fun withFallback(base: MugSnapshot): MugSnapshot = MugSnapshot(
+        name = name ?: base.name,
+        currentTemperatureC = currentTemperatureC ?: base.currentTemperatureC,
+        targetTemperatureC = targetTemperatureC ?: base.targetTemperatureC,
+        temperatureUnit = temperatureUnit ?: base.temperatureUnit,
+        liquidLevel = liquidLevel ?: base.liquidLevel,
+        batteryPercent = batteryPercent ?: base.batteryPercent,
+        charging = charging ?: base.charging,
+        liquidState = liquidState ?: base.liquidState,
+        firmwareVersion = firmwareVersion ?: base.firmwareVersion,
+        hardwareVersion = hardwareVersion ?: base.hardwareVersion,
+        bootloaderVersion = bootloaderVersion ?: base.bootloaderVersion,
+        setupKeyPresent = setupKeyPresent ?: base.setupKeyPresent,
+        ledColor = ledColor ?: base.ledColor,
+    )
+}
 
 data class MugCandidate(
     val address: String,
@@ -134,7 +207,6 @@ data class MugCandidate(
 
 enum class ConnectionState {
     DISCONNECTED,
-    SCANNING,
     PAIRING,
     CONNECTING,
     DISCOVERING,

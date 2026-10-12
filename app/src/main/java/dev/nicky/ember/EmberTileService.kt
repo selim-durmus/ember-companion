@@ -1,18 +1,24 @@
 package dev.nicky.ember
 
+import android.annotation.SuppressLint
+import android.app.PendingIntent
 import android.content.ComponentName
 import android.content.Context
+import android.content.Intent
+import android.os.Build
 import android.service.quicksettings.Tile
 import android.service.quicksettings.TileService
-import dev.nicky.ember.data.EmberAppState
+import dev.nicky.ember.data.QuickAction
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 
+/** Tap toggles the heater (off ↔ middle preset), connecting first when needed. */
 class EmberTileService : TileService() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var stateJob: Job? = null
@@ -24,7 +30,7 @@ class EmberTileService : TileService() {
         super.onStartListening()
         stateJob?.cancel()
         stateJob = scope.launch {
-            repository.state.collectLatest(::render)
+            repository.state.map(ExternalState::from).distinctUntilChanged().collect(::render)
         }
     }
 
@@ -36,16 +42,13 @@ class EmberTileService : TileService() {
 
     override fun onClick() {
         super.onClick()
-        val action = {
-            val state = repository.state.value
-            when {
-                !state.connected -> repository.connectPreferred()
-                (state.snapshot.targetTemperatureC ?: 0f) > 0f -> repository.setTargetTemperature(0f)
-                else -> state.presetsCelsius.getOrNull(1)?.let(repository::setTargetTemperature)
-            }
-            render(repository.state.value)
+        val state = repository.state.value
+        if (state.selectedAddress == null || !state.hasPermissions) {
+            openApp()
+            return
         }
-        if (isLocked) unlockAndRun(action) else action()
+        val run = { repository.runQuickAction(QuickAction.TOGGLE_HEATER) }
+        if (isLocked) unlockAndRun(run) else run()
     }
 
     override fun onDestroy() {
@@ -53,22 +56,35 @@ class EmberTileService : TileService() {
         super.onDestroy()
     }
 
-    private fun render(state: EmberAppState) {
-        qsTile ?: return
-        qsTile.label = state.selectedProfile?.displayName ?: "Ember"
-        qsTile.subtitle = when {
-            !state.connected -> "Tap to connect"
-            (state.snapshot.targetTemperatureC ?: 0f) == 0f -> "Heater off · tap for preset"
-            state.snapshot.liquidState == 6 -> "Ready · tap to turn off"
-            else -> "${state.connectionDetail} · tap to turn off"
+    @SuppressLint("StartActivityAndCollapseDeprecated")
+    private fun openApp() {
+        val intent = Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        if (Build.VERSION.SDK_INT >= 34) {
+            startActivityAndCollapse(
+                PendingIntent.getActivity(this, 30, intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE),
+            )
+        } else {
+            @Suppress("DEPRECATION")
+            startActivityAndCollapse(intent)
         }
-        qsTile.state = if (state.connected) Tile.STATE_ACTIVE else Tile.STATE_INACTIVE
-        qsTile.updateTile()
+    }
+
+    private fun render(state: ExternalState) {
+        val tile = qsTile ?: return
+        tile.label = state.name
+        tile.subtitle = when {
+            !state.hasMug -> getString(R.string.tile_set_up)
+            state.heaterOn && state.current != null && state.connected -> "${state.current} · ${state.status}"
+            state.heaterOn -> state.target?.let { getString(R.string.tile_heating_to, it) } ?: state.status
+            else -> state.presetLabel?.let { getString(R.string.tile_tap_to_heat, it) } ?: state.status
+        }
+        tile.state = if (state.heaterOn) Tile.STATE_ACTIVE else Tile.STATE_INACTIVE
+        tile.updateTile()
     }
 
     companion object {
         fun requestUpdate(context: Context) {
-            TileService.requestListeningState(context, ComponentName(context, EmberTileService::class.java))
+            runCatching { requestListeningState(context, ComponentName(context, EmberTileService::class.java)) }
         }
     }
 }
